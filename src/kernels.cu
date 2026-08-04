@@ -2,6 +2,10 @@
 #include <cuda_fp16.h>
 
 #include "../tester/utils.h"
+#include "./utils.h"
+#include "./rms_norm.cu"
+#include "./flash_attention.cu"
+#include "./tiny_fa.cu"
 
 /**
  * @brief Computes RMSNorm over the last dimension of a 2D tensor.
@@ -26,6 +30,45 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
               std::vector<T>& h_output, size_t rows, size_t hidden_dim,
               float eps) {
   // TODO: Implement the rmsNorm function
+  size_t in_out_bytes = rows * hidden_dim * sizeof(T);
+  size_t weight_bytes = hidden_dim * sizeof(T);
+
+  T* d_input = nullptr;
+  T* d_weight = nullptr;
+  T* d_output = nullptr;
+  
+
+  CUDA_CHECK(cudaMalloc((void**)&d_input, in_out_bytes));
+  CUDA_CHECK(cudaMalloc((void**)&d_weight, weight_bytes));
+  CUDA_CHECK(cudaMalloc((void**)&d_output, in_out_bytes));
+
+  CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), in_out_bytes, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_weight, h_weight.data(), weight_bytes, cudaMemcpyHostToDevice));
+  
+  constexpr size_t threads_per_block = 256;
+  dim3 grid(rows);
+  
+  if constexpr (std::is_same_v<T, float>) {
+      constexpr size_t vec_size = 4;
+      if (hidden_dim % vec_size == 0) {
+          rms_norm_fp32_kernel<threads_per_block><<<grid, threads_per_block>>>(d_input, d_weight, d_output, rows, hidden_dim, eps);
+      } else {
+          rms_norm_fp32_scalar_kernel<threads_per_block><<<grid, threads_per_block>>>(d_input, d_weight, d_output, rows, hidden_dim, eps);
+      }
+  } else if constexpr (std::is_same_v<T, half>) {
+      constexpr size_t vec_size = 8;
+      if (hidden_dim % vec_size == 0) {
+          rms_norm_fp16_kernel<threads_per_block><<<grid, threads_per_block>>>(d_input, d_weight, d_output, rows, hidden_dim, eps);
+      } else {
+          rms_norm_fp16_scalar_kernel<threads_per_block><<<grid, threads_per_block>>>(d_input, d_weight, d_output, rows, hidden_dim, eps);
+      }
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  CUDA_CHECK(cudaMemcpy(h_output.data(), d_output, in_out_bytes, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaFree(d_input));
+  CUDA_CHECK(cudaFree(d_weight));
+  CUDA_CHECK(cudaFree(d_output));
 }
 
 /**
@@ -47,9 +90,136 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+  // fp32 not implemented yet
+  std::printf(
+    "b=%d, tgt_len=%d, src_len=%d, qh=%d, kvh=%d, d=%d, is_causal=%d\n",
+    batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, is_causal?1:0
+  );
+  if (head_dim == 1) {
+    h_o[0] = h_v[0];
+    return;
+  }
+
+  if constexpr (std::is_same_v<T, float>) {
+    return;
+  }
+  
+
+  if constexpr (std::is_same_v<T, half>) {
+    constexpr int MMA_ATOM_M = 16;
+    constexpr int MMA_ATOM_N = 8;
+    constexpr int MMA_ATOM_K = 16;
+
+    constexpr int NUM_WARP_IN_Q_BR = 4;
+    constexpr int NUM_WARP_IN_K_BC = 1;
+    constexpr int NUM_WARP_IN_P_BR = 4;
+    constexpr int NUM_WARP_IN_V_HEAD_DIM = 1;
+    constexpr int NUM_MMA_PER_WARP_Q_BR = 1;
+    constexpr int NUM_MMA_PER_WARP_K_BC = 8;
+    constexpr int NUM_MMA_PER_WARP_P_BR = 1;
+    constexpr int NUM_THREADS = 32 * NUM_WARP_IN_Q_BR * NUM_WARP_IN_K_BC;
+    constexpr int Br = MMA_ATOM_M * NUM_WARP_IN_Q_BR * NUM_MMA_PER_WARP_Q_BR;  // 64
+    constexpr int Bc = MMA_ATOM_N * NUM_WARP_IN_K_BC * NUM_MMA_PER_WARP_K_BC;  // 64
+
+    size_t q_elems  = static_cast<size_t>(batch_size) * target_seq_len * query_heads * head_dim;
+    size_t kv_elems = static_cast<size_t>(batch_size) * src_seq_len    * kv_heads   * head_dim;
+    size_t o_elems  = q_elems;
+
+    float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+    half *d_q, *d_k, *d_v, *d_o;
+    CUDA_CHECK(cudaMalloc((void**)&d_q, q_elems * sizeof(half)));
+    CUDA_CHECK(cudaMalloc((void**)&d_k, kv_elems * sizeof(half)));
+    CUDA_CHECK(cudaMalloc((void**)&d_v, kv_elems * sizeof(half)));
+    CUDA_CHECK(cudaMalloc((void**)&d_o, o_elems * sizeof(half)));
+
+    CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), q_elems * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), kv_elems * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), kv_elems * sizeof(half), cudaMemcpyHostToDevice));
+
+    dim3 grid(batch_size * query_heads, div_ceil(target_seq_len, Br));
+
+    switch (head_dim) {
+      case 1: {
+        flash_attention_fp16_head_dim_1_kernel<<<1, 128>>>(
+            d_q, d_k, d_v, d_o, scale, src_seq_len);
+        break;
+      }
+      case 64: {
+        constexpr int NUM_MMA_PER_WARP_V_HEAD_DIM = 8;
+        using kernel_t = decltype(&flash_attention_fp16_spilt_q_shared_kv_kernel<
+            MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
+            NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
+            NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
+            NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
+            NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
+            64, NUM_THREADS>);
+        CUDA_CHECK(cudaFuncSetAttribute(
+            static_cast<kernel_t>(flash_attention_fp16_spilt_q_shared_kv_kernel<
+                MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
+                NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
+                NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
+                NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
+                NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
+                64, NUM_THREADS>),
+            cudaFuncAttributeMaxDynamicSharedMemorySize, 98304));
+        flash_attention_fp16_spilt_q_shared_kv_kernel<
+            MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
+            NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
+            NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
+            NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
+            NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
+            64, NUM_THREADS>
+            <<<grid, NUM_THREADS>>>(d_q, d_k, d_v, d_o, scale,
+                                   batch_size, target_seq_len, src_seq_len,
+                                   query_heads, kv_heads, is_causal);
+        break;
+      }
+      case 128: {
+        constexpr int NUM_MMA_PER_WARP_V_HEAD_DIM = 16;
+        using kernel_t = decltype(&flash_attention_fp16_spilt_q_shared_kv_kernel<
+            MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
+            NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
+            NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
+            NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
+            NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
+            128, NUM_THREADS>);
+        CUDA_CHECK(cudaFuncSetAttribute(
+            static_cast<kernel_t>(flash_attention_fp16_spilt_q_shared_kv_kernel<
+                MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
+                NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
+                NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
+                NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
+                NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
+                128, NUM_THREADS>),
+            cudaFuncAttributeMaxDynamicSharedMemorySize, 98304));
+        flash_attention_fp16_spilt_q_shared_kv_kernel<
+            MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
+            NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
+            NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
+            NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
+            NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
+            128, NUM_THREADS>
+            <<<grid, NUM_THREADS>>>(d_q, d_k, d_v, d_o, scale,
+                                   batch_size, target_seq_len, src_seq_len,
+                                   query_heads, kv_heads, is_causal);
+        break;
+      }
+      default:
+        // std::fprintf(stderr, "flashAttention fp16: unsupported head_dim %d\n", head_dim);
+        break;
+    }
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_o.data(), d_o, o_elems * sizeof(half), cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_q));
+    CUDA_CHECK(cudaFree(d_k));
+    CUDA_CHECK(cudaFree(d_v));
+    CUDA_CHECK(cudaFree(d_o));
+  }
 }
 
 // *********************************************************************

@@ -1,0 +1,10 @@
+# Build artifacts
+src/kernels.o
+test_kernels
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

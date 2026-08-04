@@ -1,0 +1,56 @@
+=== Attention Tests ===
+batch_size = 1,target_seq_len=1,src_seq_len=1024,query_heads=1,kv_heads=1,head_dim=1,is_causal=1
+Test # 1: float  | Verification: Failed
+batch_size = 1,target_seq_len=1,src_seq_len=1024,query_heads=1,kv_heads=1,head_dim=1,is_causal=1
+Test # 1: half   | Verification: Failed
+batch_size = 1,target_seq_len=3,src_seq_len=3,query_heads=3,kv_heads=1,head_dim=2,is_causal=1
+Test # 2: float  | Verification: Failed
+batch_size = 1,target_seq_len=3,src_seq_len=3,query_heads=3,kv_heads=1,head_dim=2,is_causal=1
+Test # 2: half   | Verification: Failed
+batch_size = 1,target_seq_len=8,src_seq_len=8,query_heads=8,kv_heads=4,head_dim=4,is_causal=0
+Test # 3: float  | Verification: Failed
+batch_size = 1,target_seq_len=8,src_seq_len=8,query_heads=8,kv_heads=4,head_dim=4,is_causal=0
+Test # 3: half   | Verification: Failed
+batch_size = 2,target_seq_len=16,src_seq_len=16,query_heads=16,kv_heads=8,head_dim=8,is_causal=1
+Test # 4: float  | Verification: Failed
+batch_size = 2,target_seq_len=16,src_seq_len=16,query_heads=16,kv_heads=8,head_dim=8,is_causal=1
+Test # 4: half   | Verification: Failed
+batch_size = 1,target_seq_len=32,src_seq_len=32,query_heads=32,kv_heads=16,head_dim=16,is_causal=0
+Test # 5: float  | Verification: Failed
+batch_size = 1,target_seq_len=32,src_seq_len=32,query_heads=32,kv_heads=16,head_dim=16,is_causal=0
+Test # 5: half   | Verification: Failed
+batch_size = 4,target_seq_len=64,src_seq_len=64,query_heads=64,kv_heads=32,head_dim=32,is_causal=1
+Test # 6: float  | Verification: Failed
+batch_size = 4,target_seq_len=64,src_seq_len=64,query_heads=64,kv_heads=32,head_dim=32,is_causal=1
+Test # 6: half   | Verification: Failed
+batch_size = 1,target_seq_len=8,src_seq_len=8,query_heads=8,kv_heads=2,head_dim=8,is_causal=0
+Test # 7: float  | Verification: Failed
+batch_size = 1,target_seq_len=8,src_seq_len=8,query_heads=8,kv_heads=2,head_dim=8,is_causal=0
+Test # 7: half   | Verification: Failed
+batch_size = 1,target_seq_len=8,src_seq_len=8,query_heads=8,kv_heads=2,head_dim=8,is_causal=1
+Test # 8: float  | Verification: Failed
+batch_size = 1,target_seq_len=8,src_seq_len=8,query_heads=8,kv_heads=2,head_dim=8,is_causal=1
+Test # 8: half   | Verification: Failed
+batch_size = 2,target_seq_len=16,src_seq_len=16,query_heads=12,kv_heads=3,head_dim=8,is_causal=0
+Test # 9: float  | Verification: Failed
+batch_size = 2,target_seq_len=16,src_seq_len=16,query_heads=12,kv_heads=3,head_dim=8,is_causal=0
+Test # 9: half   | Verification: Failed
+batch_size = 1,target_seq_len=64,src_seq_len=64,query_heads=16,kv_heads=4,head_dim=8,is_causal=1
+Test #10: float  | Verification: Failed
+batch_size = 1,target_seq_len=64,src_seq_len=64,query_heads=16,kv_heads=4,head_dim=8,is_causal=1
+Test #10: half   | Verification: Failed
+batch_size = 1,target_seq_len=16,src_seq_len=32,query_heads=8,kv_heads=4,head_dim=16,is_causal=1
+Test #11: float  | Verification: Failed
+batch_size = 1,target_seq_len=16,src_seq_len=32,query_heads=8,kv_heads=4,head_dim=16,is_causal=1
+Test #11: half   | Verification: Failed
+batch_size = 2,target_seq_len=32,src_seq_len=16,query_heads=16,kv_heads=4,head_dim=16,is_causal=0
+Test #12: float  | Verification: Failed
+batch_size = 2,target_seq_len=32,src_seq_len=16,query_heads=16,kv_heads=4,head_dim=16,is_causal=0
+Test #12: half   | Verification: Failed
+batch_size = 2,target_seq_len=256,src_seq_len=256,query_heads=32,kv_heads=32,head_dim=64,is_causal=0
+Test #13: float  | Verification: Failed
+batch_size = 2,target_seq_len=256,src_seq_len=256,query_heads=32,kv_heads=32,head_dim=64,is_causal=0
+Test #13: half   | Verification: Failed
+batch_size = 4,target_seq_len=512,src_seq_len=2048,query_heads=64,kv_heads=64,head_dim=32,is_causal=1
+Test #14: float  | Verification: Failed
+batch_size = 4,target_seq_len=512,src_seq_len=2048,query_heads=64,kv_heads=64,head_dim=32,is_causal=1

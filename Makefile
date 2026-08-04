@@ -15,45 +15,47 @@ PLATFORM        ?= nvidia
 PLATFORM_DEFINE ?= -DPLATFORM_NVIDIA
 STUDENT_SUFFIX  := cu
 CFLAGS          := -std=c++17 -O0
-EXTRA_LIBS     	:= 
+EXTRA_LIBS     	:=
 
 # Compiler & Tester object selection based on PLATFORM
 ifeq ($(PLATFORM),nvidia)
-    CC          	:= nvcc
-    TEST_OBJ    	:= tester/tester_nv.o
+	CC          	:= nvcc
+	TEST_OBJ    	:= tester/tester_nv.o
 	PLATFORM_DEFINE := -DPLATFORM_NVIDIA
+	COMPAT_OBJ  	:= src/cuda_compat.o
+	CFLAGS          += -arch=sm_80
 else ifeq ($(PLATFORM),iluvatar)
-    CC          	:= clang++
+	CC          	:= clang++
 	CFLAGS          := -std=c++17 -O3
-    TEST_OBJ    	:= tester/tester_iluvatar.o
+	TEST_OBJ    	:= tester/tester_iluvatar.o
 	PLATFORM_DEFINE := -DPLATFORM_ILUVATAR
 	EXTRA_LIBS		:= -lcudart -I/usr/local/corex/include -L/usr/local/corex/lib64 -fPIC
 else ifeq ($(PLATFORM),moore)
-    CC          	:= mcc
+	CC          	:= mcc
 	CFLAGS          := -std=c++11 -O3
-    TEST_OBJ    	:= tester/tester_moore.o
+	TEST_OBJ    	:= tester/tester_moore.o
 	STUDENT_SUFFIX  := mu
 	PLATFORM_DEFINE := -DPLATFORM_MOORE
 	EXTRA_LIBS		:= -I/usr/local/musa/include -L/usr/lib/gcc/x86_64-linux-gnu/11/ -L/usr/local/musa/lib -lmusart
 else ifeq ($(PLATFORM),metax)
-    CC          	:= mxcc
-    TEST_OBJ    	:= tester/tester_metax.o
+	CC          	:= mxcc
+	TEST_OBJ    	:= tester/tester_metax.o
 	STUDENT_SUFFIX  := maca
 	PLATFORM_DEFINE := -DPLATFORM_METAX
 else
-    $(error Unsupported PLATFORM '$(PLATFORM)' (expected: nvidia, iluvatar, moore, metax))
+	$(error Unsupported PLATFORM '$(PLATFORM)' (expected: nvidia, iluvatar, moore, metax))
 endif
 
 # Executable name
 TARGET          	:= test_kernels
 # Kernel implementation
-STUDENT_SRC     	:= src/kernels.$(STUDENT_SUFFIX) 
+STUDENT_SRC     	:= src/kernels.$(STUDENT_SUFFIX)
 # Compiled student object (auto-generated)
 STUDENT_OBJ  		:= $(addsuffix .o,$(basename $(STUDENT_SRC)))
 # Tester's actual verbose argument (e.g., --verbose, -v)
 TEST_VERBOSE_FLAG 	:= --verbose
 # User-provided verbose mode (true/false; default: false)
-VERBOSE         	:=  
+VERBOSE         	:=
 
 # -------------------------------
 # Process User Input (VERBOSE → Tester Flag)
@@ -87,13 +89,13 @@ run: $(TARGET)
 # Clean target: Delete temporary files (executable + src object)
 clean:
 	@echo "=== Cleaning temporary files ==="
-	rm -f $(TARGET) $(STUDENT_OBJ)
+	rm -f $(TARGET) $(STUDENT_OBJ) $(COMPAT_OBJ)
 
 # -------------------------------
 # Dependency Rules (Core Logic)
 # -------------------------------
 # Generate executable: Link kernel code (kernels.o) with test logic (tester.o)
-$(TARGET): $(STUDENT_OBJ) $(TEST_OBJ)
+$(TARGET): $(STUDENT_OBJ) $(TEST_OBJ) $(COMPAT_OBJ)
 	@echo "=== Linking executable (student code + test logic) ==="
 	$(CC) $(CFLAGS) $(PLATFORM_DEFINE) -o $@ $^ $(EXTRA_LIBS)
 
@@ -101,3 +103,8 @@ $(TARGET): $(STUDENT_OBJ) $(TEST_OBJ)
 $(STUDENT_OBJ): $(STUDENT_SRC)
 	@echo "=== Compiling student code ($(STUDENT_SRC)) ==="
 	$(CC) $(CFLAGS) $(PLATFORM_DEFINE) -c $< -o $@
+
+# CUDA 13 compatibility shim (maps cudaGetDeviceProperties_v2 -> cudaGetDeviceProperties)
+$(COMPAT_OBJ): src/cuda_compat.cu
+	@echo "=== Compiling CUDA 13 compatibility shim ==="
+	$(CC) $(CFLAGS) -c $< -o $@
