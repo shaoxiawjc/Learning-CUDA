@@ -22,7 +22,6 @@ ifeq ($(PLATFORM),nvidia)
 	CC          	:= nvcc
 	TEST_OBJ    	:= tester/tester_nv.o
 	PLATFORM_DEFINE := -DPLATFORM_NVIDIA
-	COMPAT_OBJ  	:= src/cuda_compat.o
 	CFLAGS          += -arch=sm_80
 else ifeq ($(PLATFORM),iluvatar)
 	CC          	:= clang++
@@ -89,13 +88,13 @@ run: $(TARGET)
 # Clean target: Delete temporary files (executable + src object)
 clean:
 	@echo "=== Cleaning temporary files ==="
-	rm -f $(TARGET) $(STUDENT_OBJ) $(COMPAT_OBJ)
+	rm -f $(TARGET) $(STUDENT_OBJ)
 
 # -------------------------------
 # Dependency Rules (Core Logic)
 # -------------------------------
 # Generate executable: Link kernel code (kernels.o) with test logic (tester.o)
-$(TARGET): $(STUDENT_OBJ) $(TEST_OBJ) $(COMPAT_OBJ)
+$(TARGET): $(STUDENT_OBJ) $(TEST_OBJ)
 	@echo "=== Linking executable (student code + test logic) ==="
 	$(CC) $(CFLAGS) $(PLATFORM_DEFINE) -o $@ $^ $(EXTRA_LIBS)
 
@@ -104,7 +103,3 @@ $(STUDENT_OBJ): $(STUDENT_SRC)
 	@echo "=== Compiling student code ($(STUDENT_SRC)) ==="
 	$(CC) $(CFLAGS) $(PLATFORM_DEFINE) -c $< -o $@
 
-# CUDA 13 compatibility shim (maps cudaGetDeviceProperties_v2 -> cudaGetDeviceProperties)
-$(COMPAT_OBJ): src/cuda_compat.cu
-	@echo "=== Compiling CUDA 13 compatibility shim ==="
-	$(CC) $(CFLAGS) -c $< -o $@

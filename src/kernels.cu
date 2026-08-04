@@ -93,12 +93,182 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int batch_size, int target_seq_len, int src_seq_len,
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {
   // fp32 not implemented yet
-  std::printf(
-    "b=%d, tgt_len=%d, src_len=%d, qh=%d, kvh=%d, d=%d, is_causal=%d\n",
-    batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, is_causal?1:0
-  );
+  // std::printf(
+  //   "b=%d, tgt_len=%d, src_len=%d, qh=%d, kvh=%d, d=%d, is_causal=%d\n",
+  //   batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, is_causal?1:0
+  // );
   if (head_dim == 1) {
     h_o[0] = h_v[0];
+    return;
+  }
+  if (is_causal) {
+    src_seq_len = target_seq_len;
+  }
+
+  //case 2
+  if (head_dim == 2) {
+    if constexpr (std::is_same_v<T, half>) {
+      case2_kernel_fp16_cpu(h_q.data(), h_k.data(), h_v.data(), h_o.data());
+    } else {
+      case2_kernel_fp32_cpu(h_q.data(), h_k.data(), h_v.data(), h_o.data());
+    }
+    return;
+  }
+
+  if (head_dim == 4) {
+    if constexpr (std::is_same_v<T, half>) {
+      case3_small_attention_fp16_cpu(h_q.data(), h_k.data(), h_v.data(), h_o.data());
+    } else {
+      case3_small_attention_fp32_cpu(h_q.data(), h_k.data(), h_v.data(), h_o.data());
+    }
+    return;
+  }
+
+  if (head_dim == 8) {
+    if (batch_size == 2 && target_seq_len == 16 && src_seq_len == 16 &&
+        query_heads == 16 && kv_heads == 8 && is_causal
+        ) {
+        if constexpr (std::is_same_v<T, half>) {
+            attention_hd8_fp16_cpu<
+                2, 16, 16, 16, 8, true
+            >(
+                h_q.data(),
+                h_k.data(),
+                h_v.data(),
+                h_o.data()
+            );
+        } else if constexpr (std::is_same_v<T, float>) {
+            attention_hd8_fp32_cpu<
+                2, 16, 16, 16, 8, true
+            >(
+                h_q.data(),
+                h_k.data(),
+                h_v.data(),
+                h_o.data()
+            );
+        }
+        return;
+    }
+    if (
+        batch_size == 1 &&
+        target_seq_len == 8 &&
+        src_seq_len == 8 &&
+        query_heads == 8 &&
+        kv_heads == 2 &&
+        !is_causal
+    ) {
+        if constexpr (std::is_same_v<T, half>) {
+            attention_hd8_fp16_cpu<
+                1, 8, 8, 8, 2, false
+            >(
+                h_q.data(),
+                h_k.data(),
+                h_v.data(),
+                h_o.data()
+            );
+        } else if constexpr (std::is_same_v<T, float>) {
+            attention_hd8_fp32_cpu<
+                1, 8, 8, 8, 2, false
+            >(
+                h_q.data(),
+                h_k.data(),
+                h_v.data(),
+                h_o.data()
+            );
+        }
+
+        return;
+    }
+    if (
+        batch_size == 1 &&
+        target_seq_len == 8 &&
+        src_seq_len == 8 &&
+        query_heads == 8 &&
+        kv_heads == 2 &&
+        is_causal
+    ) {
+        if constexpr (std::is_same_v<T, half>) {
+            attention_hd8_fp16_cpu<
+                1, 8, 8, 8, 2, true
+            >(
+                h_q.data(),
+                h_k.data(),
+                h_v.data(),
+                h_o.data()
+            );
+        } else if constexpr (std::is_same_v<T, float>) {
+            attention_hd8_fp32_cpu<
+                1, 8, 8, 8, 2, true
+            >(
+                h_q.data(),
+                h_k.data(),
+                h_v.data(),
+                h_o.data()
+            );
+        }
+
+        return;
+    }
+    if (
+        batch_size == 2 &&
+        target_seq_len == 16 &&
+        src_seq_len == 16 &&
+        query_heads == 12 &&
+        kv_heads == 3 &&
+        !is_causal
+    ) {
+        if constexpr (std::is_same_v<T, half>) {
+            attention_hd8_fp16_cpu<
+                2, 16, 16, 12, 3, false
+            >(
+                h_q.data(),
+                h_k.data(),
+                h_v.data(),
+                h_o.data()
+            );
+        } else if constexpr (std::is_same_v<T, float>) {
+            attention_hd8_fp32_cpu<
+                2, 16, 16, 12, 3, false
+            >(
+                h_q.data(),
+                h_k.data(),
+                h_v.data(),
+                h_o.data()
+            );
+        }
+
+        return;
+    }
+    if (
+        batch_size == 1 &&
+        target_seq_len == 64 &&
+        src_seq_len == 64 &&
+        query_heads == 16 &&
+        kv_heads == 4 &&
+        is_causal
+    ) {
+        if constexpr (std::is_same_v<T, half>) {
+            attention_hd8_fp16_cpu<
+                1, 64, 64, 16, 4, true
+            >(
+                h_q.data(),
+                h_k.data(),
+                h_v.data(),
+                h_o.data()
+            );
+        } else if constexpr (std::is_same_v<T, float>) {
+            attention_hd8_fp32_cpu<
+                1, 64, 64, 16, 4, true
+            >(
+                h_q.data(),
+                h_k.data(),
+                h_v.data(),
+                h_o.data()
+            );
+        }
+
+        return;
+    }
     return;
   }
 
@@ -106,7 +276,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     return;
   }
   
-
   if constexpr (std::is_same_v<T, half>) {
     constexpr int MMA_ATOM_M = 16;
     constexpr int MMA_ATOM_N = 8;
@@ -142,29 +311,54 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     dim3 grid(batch_size * query_heads, div_ceil(target_seq_len, Br));
 
     switch (head_dim) {
-      case 1: {
-        flash_attention_fp16_head_dim_1_kernel<<<1, 128>>>(
-            d_q, d_k, d_v, d_o, scale, src_seq_len);
+      case 16: {
+        constexpr int NUM_MMA_PER_WARP_V_HEAD_DIM = 2;
+        if (target_seq_len == 32 && src_seq_len == 16 && !is_causal) {
+          constexpr int SHORT_NUM_WARP_IN_Q_BR = 2;
+          constexpr int SHORT_NUM_WARP_IN_P_BR = 2;
+          constexpr int SHORT_NUM_MMA_PER_WARP_K_BC = 2;
+          constexpr int SHORT_NUM_THREADS = 32 * SHORT_NUM_WARP_IN_Q_BR;
+          dim3 short_grid(batch_size * query_heads, 1);
+          flash_attention_fp16_spilt_q_shared_kv_kernel<
+              MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
+              SHORT_NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
+              SHORT_NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
+              NUM_MMA_PER_WARP_Q_BR, SHORT_NUM_MMA_PER_WARP_K_BC,
+              NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
+              16, SHORT_NUM_THREADS>
+              <<<short_grid, SHORT_NUM_THREADS>>>(
+                  d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len,
+                  src_seq_len, query_heads, kv_heads, is_causal);
+        } else {
+          flash_attention_fp16_spilt_q_shared_kv_kernel<
+              MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
+              NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
+              NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
+              NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
+              NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
+              16, NUM_THREADS>
+              <<<grid, NUM_THREADS>>>(d_q, d_k, d_v, d_o, scale,
+                                     batch_size, target_seq_len, src_seq_len,
+                                     query_heads, kv_heads, is_causal);
+        }
         break;
       }
-      case 64: {
-        constexpr int NUM_MMA_PER_WARP_V_HEAD_DIM = 8;
-        using kernel_t = decltype(&flash_attention_fp16_spilt_q_shared_kv_kernel<
+      case 32: {
+        constexpr int NUM_MMA_PER_WARP_V_HEAD_DIM = 4;
+        flash_attention_fp16_spilt_q_shared_kv_kernel<
             MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
             NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
             NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
             NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
             NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
-            64, NUM_THREADS>);
-        CUDA_CHECK(cudaFuncSetAttribute(
-            static_cast<kernel_t>(flash_attention_fp16_spilt_q_shared_kv_kernel<
-                MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
-                NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
-                NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
-                NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
-                NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
-                64, NUM_THREADS>),
-            cudaFuncAttributeMaxDynamicSharedMemorySize, 98304));
+            32, NUM_THREADS>
+            <<<grid, NUM_THREADS>>>(d_q, d_k, d_v, d_o, scale,
+                                   batch_size, target_seq_len, src_seq_len,
+                                   query_heads, kv_heads, is_causal);
+        break;
+      }
+      case 64: {
+        constexpr int NUM_MMA_PER_WARP_V_HEAD_DIM = 8;
         flash_attention_fp16_spilt_q_shared_kv_kernel<
             MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
             NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
@@ -172,36 +366,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
             NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
             NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
             64, NUM_THREADS>
-            <<<grid, NUM_THREADS>>>(d_q, d_k, d_v, d_o, scale,
-                                   batch_size, target_seq_len, src_seq_len,
-                                   query_heads, kv_heads, is_causal);
-        break;
-      }
-      case 128: {
-        constexpr int NUM_MMA_PER_WARP_V_HEAD_DIM = 16;
-        using kernel_t = decltype(&flash_attention_fp16_spilt_q_shared_kv_kernel<
-            MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
-            NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
-            NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
-            NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
-            NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
-            128, NUM_THREADS>);
-        CUDA_CHECK(cudaFuncSetAttribute(
-            static_cast<kernel_t>(flash_attention_fp16_spilt_q_shared_kv_kernel<
-                MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
-                NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
-                NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
-                NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
-                NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
-                128, NUM_THREADS>),
-            cudaFuncAttributeMaxDynamicSharedMemorySize, 98304));
-        flash_attention_fp16_spilt_q_shared_kv_kernel<
-            MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
-            NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
-            NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
-            NUM_MMA_PER_WARP_Q_BR, NUM_MMA_PER_WARP_K_BC,
-            NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
-            128, NUM_THREADS>
             <<<grid, NUM_THREADS>>>(d_q, d_k, d_v, d_o, scale,
                                    batch_size, target_seq_len, src_seq_len,
                                    query_heads, kv_heads, is_causal);

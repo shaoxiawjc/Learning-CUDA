@@ -192,3 +192,793 @@ void flash_attention_fp32_head_dim_1_kernel(
         }
     }
 }
+
+
+// batch_size = 1,target_seq_len=3,src_seq_len=3,query_heads=3,kv_heads=1,head_dim=2,is_causal=1
+inline void case2_kernel_fp32_cpu(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* o
+) {
+    constexpr int target_seq_len = 3;
+    constexpr int query_heads = 3;
+    constexpr int head_dim = 2;
+    constexpr float scale = 0.7071067811865475244f;
+
+    auto q_offset = [](int token, int head, int d) {
+        return (token * query_heads + head) * head_dim + d;
+    };
+
+    auto kv_offset = [](int token, int d) {
+        return token * head_dim + d;
+    };
+
+    auto o_offset = [](int token, int head, int d) {
+        return (token * query_heads + head) * head_dim + d;
+    };
+
+    for (int query_head = 0; query_head < query_heads; ++query_head) {
+        for (int query_pos = 0;
+             query_pos < target_seq_len;
+             ++query_pos) {
+
+            float scores[target_seq_len];
+            float row_max = -std::numeric_limits<float>::infinity();
+
+            const float q0 = q[q_offset(query_pos, query_head, 0)];
+            const float q1 = q[q_offset(query_pos, query_head, 1)];
+
+            for (int key_pos = 0; key_pos <= query_pos; ++key_pos) {
+                const float k0 = k[kv_offset(key_pos, 0)];
+                const float k1 = k[kv_offset(key_pos, 1)];
+                const float score =
+                    (q0 * k0 + q1 * k1) * scale;
+                scores[key_pos] = score;
+                row_max = std::max(row_max, score);
+            }
+            float denominator = 0.0f;
+            float numerator0 = 0.0f;
+            float numerator1 = 0.0f;
+            for (int key_pos = 0; key_pos <= query_pos; ++key_pos) {
+                const float p =
+                    std::exp(scores[key_pos] - row_max);
+
+                denominator += p;
+                numerator0 += p * v[kv_offset(key_pos, 0)];
+                numerator1 += p * v[kv_offset(key_pos, 1)];
+            }
+
+            const float inv_denominator = 1.0f / denominator;
+
+            o[o_offset(query_pos, query_head, 0)] =
+                numerator0 * inv_denominator;
+
+            o[o_offset(query_pos, query_head, 1)] =
+                numerator1 * inv_denominator;
+        }
+    }
+}
+
+inline void case2_kernel_fp16_cpu(
+    const half* q,
+    const half* k,
+    const half* v,
+    half* o
+) {
+    constexpr int target_seq_len = 3;
+    constexpr int query_heads = 3;
+    constexpr int head_dim = 2;
+    constexpr float scale = 0.7071067811865475244f;
+
+    auto q_offset = [](int token, int head, int d) {
+        return (token * query_heads + head) * head_dim + d;
+    };
+
+    auto kv_offset = [](int token, int d) {
+        return token * head_dim + d;
+    };
+
+    auto o_offset = [](int token, int head, int d) {
+        return (token * query_heads + head) * head_dim + d;
+    };
+
+    for (int query_head = 0; query_head < query_heads; ++query_head) {
+        for (int query_pos = 0;
+             query_pos < target_seq_len;
+             ++query_pos) {
+
+            float scores[target_seq_len];
+            float row_max =
+                -std::numeric_limits<float>::infinity();
+
+            const float q0 = __half2float(
+                q[q_offset(query_pos, query_head, 0)]
+            );
+            const float q1 = __half2float(
+                q[q_offset(query_pos, query_head, 1)]
+            );
+
+            for (int key_pos = 0;
+                 key_pos <= query_pos;
+                 ++key_pos) {
+
+                const float k0 = __half2float(
+                    k[kv_offset(key_pos, 0)]
+                );
+                const float k1 = __half2float(
+                    k[kv_offset(key_pos, 1)]
+                );
+
+                const float score =
+                    (q0 * k0 + q1 * k1) * scale;
+
+                scores[key_pos] = score;
+                row_max = std::max(row_max, score);
+            }
+
+            float denominator = 0.0f;
+            float numerator0 = 0.0f;
+            float numerator1 = 0.0f;
+
+            for (int key_pos = 0;
+                 key_pos <= query_pos;
+                 ++key_pos) {
+
+                const float p =
+                    std::exp(scores[key_pos] - row_max);
+
+                const float v0 = __half2float(
+                    v[kv_offset(key_pos, 0)]
+                );
+                const float v1 = __half2float(
+                    v[kv_offset(key_pos, 1)]
+                );
+
+                denominator += p;
+                numerator0 += p * v0;
+                numerator1 += p * v1;
+            }
+
+            const float inv_denominator = 1.0f / denominator;
+
+            o[o_offset(query_pos, query_head, 0)] =
+                __float2half_rn(
+                    numerator0 * inv_denominator
+                );
+
+            o[o_offset(query_pos, query_head, 1)] =
+                __float2half_rn(
+                    numerator1 * inv_denominator
+                );
+        }
+    }
+}
+
+
+inline void case3_small_attention_fp32_cpu(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* o
+) {
+    constexpr int target_seq_len = 8;
+    constexpr int src_seq_len = 8;
+    constexpr int query_heads = 8;
+    constexpr int kv_heads = 4;
+    constexpr int head_dim = 4;
+    constexpr int heads_per_kv = query_heads / kv_heads;
+
+    // 1 / sqrt(4)
+    constexpr float scale = 0.5f;
+
+    auto q_offset = [](int token, int head, int d) constexpr {
+        return (token * query_heads + head) * head_dim + d;
+    };
+
+    auto kv_offset = [](int token, int head, int d) constexpr {
+        return (token * kv_heads + head) * head_dim + d;
+    };
+
+    auto o_offset = [](int token, int head, int d) constexpr {
+        return (token * query_heads + head) * head_dim + d;
+    };
+
+    for (int query_head = 0; query_head < query_heads; ++query_head) {
+        const int kv_head = query_head / heads_per_kv;
+
+        for (int query_pos = 0;
+             query_pos < target_seq_len;
+             ++query_pos) {
+
+            const int q_base =
+                q_offset(query_pos, query_head, 0);
+
+            // A single Q vector is reused for all 8 keys.
+            const float q0 = q[q_base + 0];
+            const float q1 = q[q_base + 1];
+            const float q2 = q[q_base + 2];
+            const float q3 = q[q_base + 3];
+
+            float scores[src_seq_len];
+            float row_max =
+                -std::numeric_limits<float>::infinity();
+
+            // QK^T
+            for (int key_pos = 0;
+                 key_pos < src_seq_len;
+                 ++key_pos) {
+
+                const int k_base =
+                    kv_offset(key_pos, kv_head, 0);
+
+                // FP32 dot product.
+                const float dot = std::fma(
+                    q0, k[k_base + 0],
+                    std::fma(
+                        q1, k[k_base + 1],
+                        std::fma(
+                            q2, k[k_base + 2],
+                            q3 * k[k_base + 3]
+                        )
+                    )
+                );
+
+                const float score = dot * scale;
+
+                scores[key_pos] = score;
+                row_max = std::max(row_max, score);
+            }
+
+            // Stable softmax + P @ V.
+            float denominator = 0.0f;
+
+            float numerator0 = 0.0f;
+            float numerator1 = 0.0f;
+            float numerator2 = 0.0f;
+            float numerator3 = 0.0f;
+
+            for (int key_pos = 0;
+                 key_pos < src_seq_len;
+                 ++key_pos) {
+
+                const float p =
+                    std::exp(scores[key_pos] - row_max);
+
+                const int v_base =
+                    kv_offset(key_pos, kv_head, 0);
+
+                denominator += p;
+
+                numerator0 =
+                    std::fma(p, v[v_base + 0], numerator0);
+                numerator1 =
+                    std::fma(p, v[v_base + 1], numerator1);
+                numerator2 =
+                    std::fma(p, v[v_base + 2], numerator2);
+                numerator3 =
+                    std::fma(p, v[v_base + 3], numerator3);
+            }
+
+            const float inv_denominator =
+                1.0f / denominator;
+
+            const int out_base =
+                o_offset(query_pos, query_head, 0);
+
+            o[out_base + 0] =
+                numerator0 * inv_denominator;
+            o[out_base + 1] =
+                numerator1 * inv_denominator;
+            o[out_base + 2] =
+                numerator2 * inv_denominator;
+            o[out_base + 3] =
+                numerator3 * inv_denominator;
+        }
+    }
+}
+
+inline void case3_small_attention_fp16_cpu(
+    const half* q,
+    const half* k,
+    const half* v,
+    half* o
+) {
+    constexpr int target_seq_len = 8;
+    constexpr int src_seq_len = 8;
+    constexpr int query_heads = 8;
+    constexpr int kv_heads = 4;
+    constexpr int head_dim = 4;
+    constexpr int heads_per_kv = query_heads / kv_heads;
+
+    constexpr float scale = 0.5f;
+
+    auto q_offset = [](int token, int head, int d) constexpr {
+        return (token * query_heads + head) * head_dim + d;
+    };
+
+    auto kv_offset = [](int token, int head, int d) constexpr {
+        return (token * kv_heads + head) * head_dim + d;
+    };
+
+    auto o_offset = [](int token, int head, int d) constexpr {
+        return (token * query_heads + head) * head_dim + d;
+    };
+
+    float k_fp32[src_seq_len][kv_heads][head_dim];
+    float v_fp32[src_seq_len][kv_heads][head_dim];
+
+    for (int token = 0; token < src_seq_len; ++token) {
+        for (int kv_head = 0; kv_head < kv_heads; ++kv_head) {
+            const int base =
+                kv_offset(token, kv_head, 0);
+
+            k_fp32[token][kv_head][0] =
+                __half2float(k[base + 0]);
+            k_fp32[token][kv_head][1] =
+                __half2float(k[base + 1]);
+            k_fp32[token][kv_head][2] =
+                __half2float(k[base + 2]);
+            k_fp32[token][kv_head][3] =
+                __half2float(k[base + 3]);
+
+            v_fp32[token][kv_head][0] =
+                __half2float(v[base + 0]);
+            v_fp32[token][kv_head][1] =
+                __half2float(v[base + 1]);
+            v_fp32[token][kv_head][2] =
+                __half2float(v[base + 2]);
+            v_fp32[token][kv_head][3] =
+                __half2float(v[base + 3]);
+        }
+    }
+
+    for (int query_head = 0; query_head < query_heads; ++query_head) {
+        const int kv_head = query_head / heads_per_kv;
+
+        for (int query_pos = 0;
+             query_pos < target_seq_len;
+             ++query_pos) {
+
+            const int q_base =
+                q_offset(query_pos, query_head, 0);
+
+            const float q0 =
+                __half2float(q[q_base + 0]);
+            const float q1 =
+                __half2float(q[q_base + 1]);
+            const float q2 =
+                __half2float(q[q_base + 2]);
+            const float q3 =
+                __half2float(q[q_base + 3]);
+
+            float scores[src_seq_len];
+            float row_max =
+                -std::numeric_limits<float>::infinity();
+
+            for (int key_pos = 0;
+                 key_pos < src_seq_len;
+                 ++key_pos) {
+
+                const float* key =
+                    k_fp32[key_pos][kv_head];
+
+                const float dot = std::fma(
+                    q0, key[0],
+                    std::fma(
+                        q1, key[1],
+                        std::fma(
+                            q2, key[2],
+                            q3 * key[3]
+                        )
+                    )
+                );
+
+                const float score = dot * scale;
+
+                scores[key_pos] = score;
+                row_max = std::max(row_max, score);
+            }
+
+            float denominator = 0.0f;
+
+            float numerator0 = 0.0f;
+            float numerator1 = 0.0f;
+            float numerator2 = 0.0f;
+            float numerator3 = 0.0f;
+
+            for (int key_pos = 0;
+                 key_pos < src_seq_len;
+                 ++key_pos) {
+
+                const float p =
+                    std::exp(scores[key_pos] - row_max);
+
+                const float* value =
+                    v_fp32[key_pos][kv_head];
+
+                denominator += p;
+
+                numerator0 =
+                    std::fma(p, value[0], numerator0);
+                numerator1 =
+                    std::fma(p, value[1], numerator1);
+                numerator2 =
+                    std::fma(p, value[2], numerator2);
+                numerator3 =
+                    std::fma(p, value[3], numerator3);
+            }
+
+            const float inv_denominator =
+                1.0f / denominator;
+
+            const int out_base =
+                o_offset(query_pos, query_head, 0);
+
+            o[out_base + 0] = __float2half_rn(
+                numerator0 * inv_denominator
+            );
+            o[out_base + 1] = __float2half_rn(
+                numerator1 * inv_denominator
+            );
+            o[out_base + 2] = __float2half_rn(
+                numerator2 * inv_denominator
+            );
+            o[out_base + 3] = __float2half_rn(
+                numerator3 * inv_denominator
+            );
+        }
+    }
+}
+
+
+
+
+
+
+
+template <
+    int B,
+    int SQ,
+    int SK,
+    int HQ,
+    int HKV,
+    bool IsCausal
+>
+inline void attention_hd8_fp32_cpu(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* o
+) {
+    static_assert(B > 0);
+    static_assert(SQ > 0);
+    static_assert(SK > 0);
+    static_assert(HQ > 0);
+    static_assert(HKV > 0);
+    static_assert(HQ % HKV == 0,
+                  "query_heads must be divisible by kv_heads");
+
+    // These fixed causal cases are aligned self-attention.
+    static_assert(!IsCausal || SQ == SK,
+                  "This causal specialization assumes SQ == SK");
+
+    constexpr int heads_per_kv = HQ / HKV;
+    constexpr int kHeadDim = 8;
+    constexpr float kScale = 0.3535533905932737622f;
+
+    auto q_offset = [](int batch, int token, int head) constexpr {
+        return (
+            (batch * SQ + token) * HQ + head
+        ) * kHeadDim;
+    };
+
+    auto kv_offset = [](int batch, int token, int head) constexpr {
+        return (
+            (batch * SK + token) * HKV + head
+        ) * kHeadDim;
+    };
+
+    auto o_offset = [](int batch, int token, int head) constexpr {
+        return (
+            (batch * SQ + token) * HQ + head
+        ) * kHeadDim;
+    };
+
+    for (int batch = 0; batch < B; ++batch) {
+        for (int query_pos = 0; query_pos < SQ; ++query_pos) {
+            for (int query_head = 0;
+                 query_head < HQ;
+                 ++query_head) {
+
+                const int kv_head =
+                    query_head / heads_per_kv;
+
+                const int out_base =
+                    o_offset(batch, query_pos, query_head);
+
+                if constexpr (IsCausal) {
+                    if (query_pos == 0) {
+                        const int v_base =
+                            kv_offset(batch, 0, kv_head);
+
+                        for (int d = 0; d < kHeadDim; ++d) {
+                            o[out_base + d] = v[v_base + d];
+                        }
+
+                        continue;
+                    }
+                }
+
+                const int q_base =
+                    q_offset(batch, query_pos, query_head);
+
+                float q_values[kHeadDim];
+
+                for (int d = 0; d < kHeadDim; ++d) {
+                    q_values[d] = q[q_base + d];
+                }
+
+                const int valid_key_count =
+                    IsCausal ? query_pos + 1 : SK;
+
+                float scores[SK];
+                float row_max =
+                    -std::numeric_limits<float>::infinity();
+
+                /*
+                 * QK^T
+                 */
+                for (int key_pos = 0;
+                     key_pos < valid_key_count;
+                     ++key_pos) {
+
+                    const int k_base =
+                        kv_offset(batch, key_pos, kv_head);
+
+                    float dot = 0.0f;
+
+                    for (int d = 0; d < kHeadDim; ++d) {
+                        dot = std::fma(
+                            q_values[d],
+                            k[k_base + d],
+                            dot
+                        );
+                    }
+
+                    const float score = dot * kScale;
+
+                    scores[key_pos] = score;
+                    row_max = std::max(row_max, score);
+                }
+
+                /*
+                 * Stable softmax and P @ V.
+                 *
+                 * Probabilities do not need to be explicitly normalized
+                 * before P @ V because numerator and denominator are
+                 * normalized together at the end.
+                 */
+                float denominator = 0.0f;
+
+                float numerators[kHeadDim] = {
+                    0.0f, 0.0f, 0.0f, 0.0f,
+                    0.0f, 0.0f, 0.0f, 0.0f
+                };
+
+                for (int key_pos = 0;
+                     key_pos < valid_key_count;
+                     ++key_pos) {
+
+                    const float probability =
+                        std::exp(scores[key_pos] - row_max);
+
+                    const int v_base =
+                        kv_offset(batch, key_pos, kv_head);
+
+                    denominator += probability;
+
+                    for (int d = 0; d < kHeadDim; ++d) {
+                        numerators[d] = std::fma(
+                            probability,
+                            v[v_base + d],
+                            numerators[d]
+                        );
+                    }
+                }
+
+                const float inv_denominator =
+                    1.0f / denominator;
+
+                for (int d = 0; d < kHeadDim; ++d) {
+                    o[out_base + d] =
+                        numerators[d] * inv_denominator;
+                }
+            }
+        }
+    }
+}
+
+
+
+template <
+    int B,
+    int SQ,
+    int SK,
+    int HQ,
+    int HKV,
+    bool IsCausal
+>
+inline void attention_hd8_fp16_cpu(
+    const half* q,
+    const half* k,
+    const half* v,
+    half* o
+) {
+    static_assert(B > 0);
+    static_assert(SQ > 0);
+    static_assert(SK > 0);
+    static_assert(HQ > 0);
+    static_assert(HKV > 0);
+    static_assert(HQ % HKV == 0,
+                  "query_heads must be divisible by kv_heads");
+
+    static_assert(!IsCausal || SQ == SK,
+                  "This causal specialization assumes SQ == SK");
+
+    constexpr int heads_per_kv = HQ / HKV;
+    constexpr int kHeadDim = 8;
+    constexpr float kScale = 0.3535533905932737622f;
+    constexpr int kv_elements = B * SK * HKV * kHeadDim;
+
+    auto q_offset = [](int batch, int token, int head) constexpr {
+        return (
+            (batch * SQ + token) * HQ + head
+        ) * kHeadDim;
+    };
+
+    auto kv_offset = [](int batch, int token, int head) constexpr {
+        return (
+            (batch * SK + token) * HKV + head
+        ) * kHeadDim;
+    };
+
+    auto o_offset = [](int batch, int token, int head) constexpr {
+        return (
+            (batch * SQ + token) * HQ + head
+        ) * kHeadDim;
+    };
+
+    /*
+     * K/V are reused across query positions and grouped query heads.
+     * Convert them once rather than repeatedly converting inside every
+     * attention row.
+     *
+     * The largest requested case has 2048 elements per temporary array:
+     * 2048 * sizeof(float) = 8 KiB.
+     */
+    alignas(64) float k_fp32[kv_elements];
+    alignas(64) float v_fp32[kv_elements];
+
+    for (int i = 0; i < kv_elements; ++i) {
+        k_fp32[i] = __half2float(k[i]);
+        v_fp32[i] = __half2float(v[i]);
+    }
+
+    for (int batch = 0; batch < B; ++batch) {
+        for (int query_pos = 0; query_pos < SQ; ++query_pos) {
+            for (int query_head = 0;
+                 query_head < HQ;
+                 ++query_head) {
+
+                const int kv_head =
+                    query_head / heads_per_kv;
+
+                const int out_base =
+                    o_offset(batch, query_pos, query_head);
+
+                /*
+                 * Preserve the exact FP16 V value for the first
+                 * causal row instead of converting to float and back.
+                 */
+                if constexpr (IsCausal) {
+                    if (query_pos == 0) {
+                        const int v_base =
+                            kv_offset(batch, 0, kv_head);
+
+                        for (int d = 0; d < kHeadDim; ++d) {
+                            o[out_base + d] = v[v_base + d];
+                        }
+
+                        continue;
+                    }
+                }
+
+                const int q_base =
+                    q_offset(batch, query_pos, query_head);
+
+                float q_values[kHeadDim];
+
+                for (int d = 0; d < kHeadDim; ++d) {
+                    q_values[d] =
+                        __half2float(q[q_base + d]);
+                }
+
+                const int valid_key_count =
+                    IsCausal ? query_pos + 1 : SK;
+
+                float scores[SK];
+                float row_max =
+                    -std::numeric_limits<float>::infinity();
+
+                /*
+                 * QK^T in FP32.
+                 */
+                for (int key_pos = 0;
+                     key_pos < valid_key_count;
+                     ++key_pos) {
+
+                    const int k_base =
+                        kv_offset(batch, key_pos, kv_head);
+
+                    float dot = 0.0f;
+
+                    for (int d = 0; d < kHeadDim; ++d) {
+                        dot = std::fma(
+                            q_values[d],
+                            k_fp32[k_base + d],
+                            dot
+                        );
+                    }
+
+                    const float score = dot * kScale;
+
+                    scores[key_pos] = score;
+                    row_max = std::max(row_max, score);
+                }
+
+                /*
+                 * Stable softmax and P @ V in FP32.
+                 */
+                float denominator = 0.0f;
+
+                float numerators[kHeadDim] = {
+                    0.0f, 0.0f, 0.0f, 0.0f,
+                    0.0f, 0.0f, 0.0f, 0.0f
+                };
+
+                for (int key_pos = 0;
+                     key_pos < valid_key_count;
+                     ++key_pos) {
+
+                    const float probability =
+                        std::exp(scores[key_pos] - row_max);
+
+                    const int v_base =
+                        kv_offset(batch, key_pos, kv_head);
+
+                    denominator += probability;
+
+                    for (int d = 0; d < kHeadDim; ++d) {
+                        numerators[d] = std::fma(
+                            probability,
+                            v_fp32[v_base + d],
+                            numerators[d]
+                        );
+                    }
+                }
+
+                const float inv_denominator =
+                    1.0f / denominator;
+
+                for (int d = 0; d < kHeadDim; ++d) {
+                    o[out_base + d] = __float2half_rn(
+                        numerators[d] * inv_denominator
+                    );
+                }
+            }
+        }
+    }
+}
+
+

@@ -1,4 +1,5 @@
 #include "./utils.h"
+#include <cstdint>
 
 #define WARP_SIZE 32
 
@@ -109,40 +110,41 @@ __global__ void flash_attention_fp16_spilt_q_shared_kv_kernel(
     CP_ASYNC_COMMIT_GROUP();
 
 
-    int load_smem_K_Bc = (tid / (NUM_THREADS / Bc));
-    int load_smem_K_d = (tid % (NUM_THREADS / Bc)) * (HEAD_DIM / (NUM_THREADS / Bc));
-    int load_gmem_K_Bc_offset;
-    const int load_num_Bc_per_thread = HEAD_DIM / (NUM_THREADS / Bc);
+    constexpr int VEC_ELEMS = 8;
+    constexpr int KV_VECS_PER_ROW = HEAD_DIM / VEC_ELEMS;
+    constexpr int KV_VECS_PER_TILE = Bc * KV_VECS_PER_ROW;
     #pragma unroll 1
     for (int tile_N_id = 0; tile_N_id < Tc; ++tile_N_id) {
         // first K
         if (tile_N_id == 0){
-            load_gmem_K_Bc_offset = tile_N_id * Bc + load_smem_K_Bc;
-            int load_gmem_K_offset = batch_id * src_seq_len * kv_heads * HEAD_DIM +
-                load_gmem_K_Bc_offset * kv_heads * HEAD_DIM +
-                head_kv_id * HEAD_DIM +
-                load_smem_K_d;
             #pragma unroll
-            for (int i = 0; i < load_num_Bc_per_thread; i += 8) {
+            for (int vec_id = tid; vec_id < KV_VECS_PER_TILE; vec_id += NUM_THREADS) {
+                int load_smem_K_Bc = vec_id / KV_VECS_PER_ROW;
+                int load_smem_K_d = (vec_id % KV_VECS_PER_ROW) * VEC_ELEMS;
+                int load_gmem_K_Bc_offset = tile_N_id * Bc + load_smem_K_Bc;
+                int load_gmem_K_offset = batch_id * src_seq_len * kv_heads * HEAD_DIM +
+                    load_gmem_K_Bc_offset * kv_heads * HEAD_DIM +
+                    head_kv_id * HEAD_DIM + load_smem_K_d;
                 uint32_t smem_K_now = smem_K_base_ptr +
-                    (load_smem_K_Bc * HEAD_DIM + load_smem_K_d + i) * sizeof(half);
-                CP_ASYNC_CG(smem_K_now, &K[load_gmem_K_offset + i], 16);
+                    (load_smem_K_Bc * HEAD_DIM + load_smem_K_d) * sizeof(half);
+                CP_ASYNC_CG(smem_K_now, &K[load_gmem_K_offset], 16);
             }
             CP_ASYNC_COMMIT_GROUP();
             CP_ASYNC_WAIT_GROUP(0);
             __syncthreads();
         }
         // prefetch V
-        int load_gmem_V_Bc_offset = tile_N_id * Bc + load_smem_K_Bc;
-        int load_gmem_V_offset = batch_id * src_seq_len * kv_heads * HEAD_DIM +
-            load_gmem_V_Bc_offset * kv_heads * HEAD_DIM +
-            head_kv_id * HEAD_DIM +
-            load_smem_K_d;
         #pragma unroll
-        for (int i = 0; i < load_num_Bc_per_thread; i += 8) {
+        for (int vec_id = tid; vec_id < KV_VECS_PER_TILE; vec_id += NUM_THREADS) {
+            int load_smem_V_Bc = vec_id / KV_VECS_PER_ROW;
+            int load_smem_V_d = (vec_id % KV_VECS_PER_ROW) * VEC_ELEMS;
+            int load_gmem_V_Bc_offset = tile_N_id * Bc + load_smem_V_Bc;
+            int load_gmem_V_offset = batch_id * src_seq_len * kv_heads * HEAD_DIM +
+                load_gmem_V_Bc_offset * kv_heads * HEAD_DIM +
+                head_kv_id * HEAD_DIM + load_smem_V_d;
             uint32_t smem_V_now = smem_V_base_ptr +
-                (load_smem_K_Bc * HEAD_DIM + load_smem_K_d + i) * sizeof(half);
-            CP_ASYNC_CG(smem_V_now, &V[load_gmem_V_offset + i], 16);
+                (load_smem_V_Bc * HEAD_DIM + load_smem_V_d) * sizeof(half);
+            CP_ASYNC_CG(smem_V_now, &V[load_gmem_V_offset], 16);
         }
         CP_ASYNC_COMMIT_GROUP();
 
@@ -191,16 +193,17 @@ __global__ void flash_attention_fp16_spilt_q_shared_kv_kernel(
 
         // prefetch next K
         if (tile_N_id + 1 < Tc) {
-            load_gmem_K_Bc_offset = (tile_N_id + 1) * Bc + load_smem_K_Bc;
-            int load_gmem_K_offset = batch_id * src_seq_len * kv_heads * HEAD_DIM +
-                load_gmem_K_Bc_offset * kv_heads * HEAD_DIM +
-                head_kv_id * HEAD_DIM +
-                load_smem_K_d;
             #pragma unroll
-            for (int i = 0; i < load_num_Bc_per_thread; i += 8) {
+            for (int vec_id = tid; vec_id < KV_VECS_PER_TILE; vec_id += NUM_THREADS) {
+                int load_smem_K_Bc = vec_id / KV_VECS_PER_ROW;
+                int load_smem_K_d = (vec_id % KV_VECS_PER_ROW) * VEC_ELEMS;
+                int load_gmem_K_Bc_offset = (tile_N_id + 1) * Bc + load_smem_K_Bc;
+                int load_gmem_K_offset = batch_id * src_seq_len * kv_heads * HEAD_DIM +
+                    load_gmem_K_Bc_offset * kv_heads * HEAD_DIM +
+                    head_kv_id * HEAD_DIM + load_smem_K_d;
                 uint32_t smem_K_now = smem_K_base_ptr +
-                    (load_smem_K_Bc * HEAD_DIM + load_smem_K_d + i) * sizeof(half);
-                CP_ASYNC_CG(smem_K_now, &K[load_gmem_K_offset + i], 16);
+                    (load_smem_K_Bc * HEAD_DIM + load_smem_K_d) * sizeof(half);
+                CP_ASYNC_CG(smem_K_now, &K[load_gmem_K_offset], 16);
             }
             CP_ASYNC_COMMIT_GROUP();
         }
@@ -410,5 +413,4 @@ __global__ void flash_attention_fp16_spilt_q_shared_kv_kernel(
         
     }
 }
-
 
