@@ -123,8 +123,6 @@ void flash_attention_fp32_head_dim_1_kernel(
 {
     constexpr int NUM_THREADS = 256;
     constexpr int NUM_WARPS = NUM_THREADS / 32;
-    constexpr int VEC_SIZE = 4;
-
 
     const int tid = threadIdx.x;
     const int lane_id = tid & 31;

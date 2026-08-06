@@ -320,20 +320,12 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
       }
       case 32: {
         dim3 grid(batch_size * query_heads, div_ceil(target_seq_len, 64));
-        if (is_causal) {
           // case6/case14: Bc=HEAD_DIM=32, four warps cover Br=64.
-          flash_attention_fp32_kernel<
-              64, 32, 16, 32, 4, 4, 32, 128, true>
-              <<<grid, 128>>>(
-              d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len,
-              src_seq_len, query_heads, kv_heads);
-        } else {
-          flash_attention_fp32_kernel<
-              64, 32, 16, 32, 4, 4, 32, 128, false>
-              <<<grid, 128>>>(
-              d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len,
-              src_seq_len, query_heads, kv_heads);
-        }
+        flash_attention_fp32_kernel<
+            64, 32, 16, 32, 4, 4, 32, 128, true>
+            <<<grid, 128>>>(
+            d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len,
+            src_seq_len, query_heads, kv_heads);
         break;
       }
       case 64: {
@@ -403,8 +395,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), kv_elems * sizeof(half), cudaMemcpyHostToDevice));
 
     dim3 grid(batch_size * query_heads, div_ceil(target_seq_len, Br));
-
-
 
     switch (head_dim) {
       case 16: {

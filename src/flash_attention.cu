@@ -837,17 +837,7 @@ __global__ void flash_attention_fp32_kernel(
                     int key_idx = tile_N_id * Bc + warp_n_id * Wc + lane_n_id * Tc + j;
                     if (key_idx > query_idx) {
                         reg_S[i][j] = -INFINITY;
-                    }else {
-                        reg_S[i][j] = reg_S[i][j] * scale;
                     }
-                }
-            }
-        }else {
-            #pragma unroll
-            for (int i = 0 ; i < Tr ; ++i) {
-                #pragma unroll
-                for (int j = 0 ; j < Tc ; ++j) {
-                    reg_S[i][j] = reg_S[i][j] * scale;
                 }
             }
         }
@@ -862,7 +852,7 @@ __global__ void flash_attention_fp32_kernel(
         for (int i = 0 ; i < Tr ; ++i) {
             #pragma unroll
             for (int j = 0 ; j < Tc ; ++j) {
-                block_row_max_new[i] = max(block_row_max_new[i], reg_S[i][j]);
+                block_row_max_new[i] = max(block_row_max_new[i], reg_S[i][j] * scale);
             }
             block_row_max_new[i] = warp_reduce_max<float, NUM_THREADS_PER_WARP_N>(block_row_max_new[i]);
         }
@@ -884,7 +874,7 @@ __global__ void flash_attention_fp32_kernel(
             #pragma unroll
             for (int j = 0 ; j < Tc ; ++j) {
                 float now_max = block_row_max_new[i];
-                reg_P[i][j] = expf(reg_S[i][j] - now_max);
+                reg_P[i][j] = expf(__fmaf_rn(reg_S[i][j], scale, -now_max));
                 block_row_sum_new[i] += reg_P[i][j];
             }
             block_row_sum_new[i] =
@@ -915,24 +905,19 @@ __global__ void flash_attention_fp32_kernel(
         }
 
         #pragma unroll
-        for (int owner_lane_n = 0;
-             owner_lane_n < NUM_THREADS_PER_WARP_N;
-             ++owner_lane_n) {
+        for (int owner_lane_n = 0; owner_lane_n < NUM_THREADS_PER_WARP_N; ++owner_lane_n) {
             #pragma unroll
             for (int owner_reg = 0; owner_reg < Tc; ++owner_reg) {
-                const int owner_lane =
-                    lane_m_id * NUM_THREADS_PER_WARP_N + owner_lane_n;
+                const int owner_lane = lane_m_id * NUM_THREADS_PER_WARP_N + owner_lane_n;
                 const int key_idx = owner_lane_n * Tc + owner_reg;
                 #pragma unroll
                 for (int i = 0; i < Tr; ++i) {
-                    const float p = __shfl_sync(
-                        0xffffffff, reg_P[i][owner_reg], owner_lane);
+                    const float p = __shfl_sync(0xffffffff, reg_P[i][owner_reg], owner_lane);
                     #pragma unroll
                     for (int j = 0; j < Tc; ++j) {
                         const int output_d = lane_n_id * Tc + j;
                         if (output_d < HEAD_DIM) {
-                            reg_O[i][j] = __fmaf_rn(
-                                p, smem_V[key_idx][output_d], reg_O[i][j]);
+                            reg_O[i][j] = __fmaf_rn(p, smem_V[key_idx][output_d], reg_O[i][j]);
                         }
                     }
                 }
