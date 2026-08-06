@@ -49,7 +49,6 @@ __device__ inline T warp_reduce_sum(T val) {
 }
 
 #define LDST128BITS(value) (reinterpret_cast<float4 *>(&(value))[0])
-
 #define CP_ASYNC_COMMIT_GROUP() asm volatile("cp.async.commit_group;\n" ::)
 #define CP_ASYNC_WAIT_GROUP(n)                                                 \
   asm volatile("cp.async.wait_group %0;\n" ::"n"(n))

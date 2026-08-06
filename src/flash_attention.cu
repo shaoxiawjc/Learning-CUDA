@@ -674,11 +674,11 @@ __global__ void flash_attention_fp32_kernel(
 
     // in Q @ KT, use A@BT matrix mul
     // config1: Br-64, Bc-64, Wr=16, Wc-64, Tr=4, Tc=8
-    const int NUM_WARP_M = Br / Wr;
+    // const int NUM_WARP_M = Br / Wr;
     const int NUM_WARP_N = Bc / Wc;
     const int warp_m_id = warp_id / NUM_WARP_N;
     const int warp_n_id = warp_id % NUM_WARP_N;
-    const int NUM_THREADS_PER_WARP_M = Wr / Tr;
+    // const int NUM_THREADS_PER_WARP_M = Wr / Tr;
     const int NUM_THREADS_PER_WARP_N = Wc / Tc;
     const int lane_m_id = lane_id / NUM_THREADS_PER_WARP_N;
     const int lane_n_id = lane_id % NUM_THREADS_PER_WARP_N; // must be 0

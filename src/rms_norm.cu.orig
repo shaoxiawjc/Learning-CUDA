@@ -5,7 +5,7 @@
 #include "./utils.h"
 
 union alignas(16) PackHalf8 {
-    float4 packed;
+    uint4 packed;
     __half2 data[4];
 };
 
@@ -126,16 +126,16 @@ __global__ void rms_norm_fp16_kernel(
     if (row >= rows) return;
 
     const half* row_input = input + row * hidden_dim;
+    const uint4* row_input_vec = reinterpret_cast<const uint4*>(row_input);
     half* row_output = output + row * hidden_dim;
-    // LDST128BITS exposes a non-const float4 reference. These aliases are used
-    // for loads only; input and weight remain logically read-only.
-    half* row_input_128 = const_cast<half*>(row_input);
-    half* weight_128 = const_cast<half*>(weight);
+    uint4* row_output_vec = reinterpret_cast<uint4*>(row_output);
+
+    const uint4* weight_vec = reinterpret_cast<const uint4*>(weight);
     __shared__ float sdata[WARP_SIZE];
     __shared__ float rms_inv;
 
     constexpr size_t cached_items = items_per_thread > 0 ? items_per_thread : 1;
-    float4 cached_input[cached_items];
+    uint4 cached_input[cached_items];
     float sum = 0.0f;
     if constexpr (items_per_thread > 0) {
         #pragma unroll
@@ -143,7 +143,7 @@ __global__ void rms_norm_fp16_kernel(
             const size_t i = tid + item * threads_per_block;
             if (i < num_vecs) {
                 PackHalf8 val;
-                val.packed = LDST128BITS(row_input_128[i * vec_size]);
+                val.packed = row_input_vec[i];
                 cached_input[item] = val.packed;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -156,7 +156,7 @@ __global__ void rms_norm_fp16_kernel(
     } else {
         for (size_t i = tid; i < num_vecs; i += threads_per_block) {
             PackHalf8 val;
-            val.packed = LDST128BITS(row_input_128[i * vec_size]);
+            val.packed = row_input_vec[i];
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const float2 value_f = __half22float2(val.data[j]);
@@ -196,7 +196,7 @@ __global__ void rms_norm_fp16_kernel(
                 PackHalf8 val;
                 PackHalf8 w;
                 val.packed = cached_input[item];
-                w.packed = LDST128BITS(weight_128[i * vec_size]);
+                w.packed = weight_vec[i];
                 PackHalf8 out;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -207,15 +207,15 @@ __global__ void rms_norm_fp16_kernel(
                         value_f.y * rms_inv * scale_f.y
                     );
                 }
-                LDST128BITS(row_output[i * vec_size]) = out.packed;
+                row_output_vec[i] = out.packed;
             }
         }
     } else {
         for (size_t i = tid; i < num_vecs; i += threads_per_block) {
             PackHalf8 val;
             PackHalf8 w;
-            val.packed = LDST128BITS(row_input_128[i * vec_size]);
-            w.packed = LDST128BITS(weight_128[i * vec_size]);
+            val.packed = row_input_vec[i];
+            w.packed = weight_vec[i];
             PackHalf8 out;
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -226,7 +226,7 @@ __global__ void rms_norm_fp16_kernel(
                     value_f.y * rms_inv * scale_f.y
                 );
             }
-            LDST128BITS(row_output[i * vec_size]) = out.packed;
+            row_output_vec[i] = out.packed;
         }
     }
 }
