@@ -179,12 +179,6 @@ def load_json(path):
 def plot_results(path, current, baseline=None):
     import matplotlib.pyplot as plt
 
-    if baseline and set(current) != set(baseline):
-        raise RuntimeError(
-            "current results and baseline contain different test cases; "
-            "use the same --operator and --baseline-file"
-        )
-
     suffix = path.suffix or ".png"
     stem = path.stem if path.suffix else path.name
     output_paths = []
@@ -201,7 +195,9 @@ def plot_results(path, current, baseline=None):
             for key in keys
         ]
         x = list(range(len(keys)))
-        width = 0.38 if baseline else 0.65
+        baseline_keys = [key for key in keys if baseline and key in baseline]
+        baseline_indices = [keys.index(key) for key in baseline_keys]
+        width = 0.38 if baseline_keys else 0.65
         fig, ax = plt.subplots(figsize=(max(12, len(keys) * 0.55), 7))
 
         def values_and_errors(results):
@@ -219,10 +215,13 @@ def plot_results(path, current, baseline=None):
             return centers, [lower, upper]
 
         current_centers, current_errors = values_and_errors(current)
-        if baseline:
+        if baseline_keys:
+            original_keys = keys
+            keys = baseline_keys
             baseline_centers, baseline_errors = values_and_errors(baseline)
+            keys = original_keys
             ax.bar(
-                [value - width / 2 for value in x],
+                [x[index] - width / 2 for index in baseline_indices],
                 baseline_centers,
                 width,
                 yerr=baseline_errors,
@@ -230,7 +229,11 @@ def plot_results(path, current, baseline=None):
                 label="Baseline",
                 color="#9aa0a6",
             )
-            current_x = [value + width / 2 for value in x]
+            matched = set(baseline_indices)
+            current_x = [
+                value + width / 2 if index in matched else value
+                for index, value in enumerate(x)
+            ]
         else:
             current_x = x
 

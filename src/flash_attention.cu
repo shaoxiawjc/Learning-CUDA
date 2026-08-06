@@ -86,28 +86,43 @@ __global__ void flash_attention_fp16_spilt_q_shared_kv_kernel(
         }
     }
 
-    // load Q from global memory to shared memory
-    int load_smem_Q_Br = (tid / (NUM_THREADS / Br));
-    int load_smem_Q_d = (tid % (NUM_THREADS / Br)) * (HEAD_DIM / (NUM_THREADS / Br));
-    int load_gmem_Q_Br = tile_Br_id * Br + load_smem_Q_Br;
-    int load_gmem_Q_d = load_smem_Q_d;
-    if (load_gmem_Q_Br >= target_seq_len) {
-        return;
-    }
+    // Load Q from global memory to shared memory. For HEAD_DIM=8, one
+    // thread copies one complete 16-byte row; the generic mapping assigns
+    // only four half values per thread and would make cp.async cross rows.
+    if constexpr (HEAD_DIM == 8) {
+        for (int row = tid; row < Br; row += NUM_THREADS) {
+            const int gmem_row = tile_Br_id * Br + row;
+            if (gmem_row < target_seq_len) {
+                const int gmem_offset =
+                    batch_id * target_seq_len * query_heads * HEAD_DIM +
+                    gmem_row * query_heads * HEAD_DIM +
+                    head_q_id * HEAD_DIM;
+                const uint32_t smem_ptr = smem_Q_base_ptr +
+                    row * HEAD_DIM * sizeof(half);
+                CP_ASYNC_CG(smem_ptr, &Q[gmem_offset], 16);
+            }
+        }
+    } else {
+        const int load_smem_Q_Br = tid / (NUM_THREADS / Br);
+        const int load_smem_Q_d =
+            (tid % (NUM_THREADS / Br)) * (HEAD_DIM / (NUM_THREADS / Br));
+        const int load_gmem_Q_Br = tile_Br_id * Br + load_smem_Q_Br;
+        if (load_gmem_Q_Br >= target_seq_len) {
+            return;
+        }
 
-    // Load Q into shared memory
-    // Q [batch_size, target_seq_len, query_heads, head_dim]
-    const int load_num_Br_per_thread = HEAD_DIM / (NUM_THREADS / Br);
-    int gmem_Q_offset = batch_id * target_seq_len * query_heads * HEAD_DIM +
-        load_gmem_Q_Br * query_heads * HEAD_DIM +
-        head_q_id * HEAD_DIM +
-        load_gmem_Q_d;
-    // HEAD_DIM Must be a multiple of 8
-    #pragma unroll
-    for (int i = 0; i < load_num_Br_per_thread; i += 8) {
-        uint32_t smem_Q = smem_Q_base_ptr +
-            (load_smem_Q_Br * HEAD_DIM + load_smem_Q_d + i) * sizeof(half);
-        CP_ASYNC_CG(smem_Q, &Q[gmem_Q_offset + i], 16);
+        const int load_num_Br_per_thread = HEAD_DIM / (NUM_THREADS / Br);
+        const int gmem_Q_offset =
+            batch_id * target_seq_len * query_heads * HEAD_DIM +
+            load_gmem_Q_Br * query_heads * HEAD_DIM +
+            head_q_id * HEAD_DIM + load_smem_Q_d;
+        #pragma unroll
+        for (int i = 0; i < load_num_Br_per_thread; i += 8) {
+            const uint32_t smem_ptr = smem_Q_base_ptr +
+                (load_smem_Q_Br * HEAD_DIM + load_smem_Q_d + i) *
+                    sizeof(half);
+            CP_ASYNC_CG(smem_ptr, &Q[gmem_Q_offset + i], 16);
+        }
     }
     CP_ASYNC_COMMIT_GROUP();
 
@@ -150,9 +165,8 @@ __global__ void flash_attention_fp16_spilt_q_shared_kv_kernel(
         }
         CP_ASYNC_COMMIT_GROUP();
 
-        const int tile_k_num = HEAD_DIM / MMA_ATOM_K;
         #pragma unroll
-        for (int i = 0 ; i < NUM_MMA_PER_WARP_Q_BR; ++i) {
+        for (int i = 0; i < NUM_MMA_PER_WARP_Q_BR; ++i) {
             #pragma unroll
             for (int j = 0; j < NUM_MMA_PER_WARP_K_BC; ++j) {
                 reg_S[i][j][0] = 0.0f;
@@ -162,33 +176,79 @@ __global__ void flash_attention_fp16_spilt_q_shared_kv_kernel(
             }
         }
 
-        for (int tile_k_id = 0; tile_k_id < tile_k_num; ++tile_k_id) {
-            // load Q from shared memory to registers
+        if constexpr (HEAD_DIM == 8) {
+            // Q is a 16x8 row-major A fragment: two b32 registers.
             #pragma unroll
-            for (int i = 0 ; i < NUM_MMA_PER_WARP_Q_BR; ++i) {
-                // a warp load 16x16 matrix
-                // each each thread has 4 elements
-                int warp_smem_Q_Br = warp_Q_id * (NUM_MMA_PER_WARP_Q_BR * MMA_ATOM_M) + i * MMA_ATOM_M;
-                int lane_smem_Q_Br = warp_smem_Q_Br + lane_id % 16;
-                int lane_smem_Q_d = tile_k_id * MMA_ATOM_K + (lane_id / 16) * 8;
-                uint32_t lane_smem_Q_ptr = smem_Q_base_ptr + (lane_smem_Q_Br * HEAD_DIM + lane_smem_Q_d) * sizeof(half);
-                LDMATRIX_X4(reg_Q[i][0], reg_Q[i][1], reg_Q[i][2], reg_Q[i][3], lane_smem_Q_ptr);
+            for (int i = 0; i < NUM_MMA_PER_WARP_Q_BR; ++i) {
+                const int warp_row =
+                    warp_Q_id * (NUM_MMA_PER_WARP_Q_BR * MMA_ATOM_M) +
+                    i * MMA_ATOM_M;
+                const int lane_row = warp_row + lane_id % 16;
+                const uint32_t q_ptr = smem_Q_base_ptr +
+                    lane_row * HEAD_DIM * sizeof(half);
+                LDMATRIX_X2(reg_Q[i][0], reg_Q[i][1], q_ptr);
             }
-            // load K from shared memory to registers
-            #pragma unroll
-            for (int i = 0 ; i < NUM_MMA_PER_WARP_K_BC; ++i) {
-                int warp_smem_K_Bc = warp_KV_id * (NUM_MMA_PER_WARP_K_BC * MMA_ATOM_N) + i * MMA_ATOM_N;
-                int lane_smem_K_Bc = warp_smem_K_Bc + lane_id % 8;
-                int lane_smem_K_d = tile_k_id * MMA_ATOM_K + ((lane_id / 8) % 2) * 8;
-                uint32_t lane_smem_K_ptr = smem_K_base_ptr + (lane_smem_K_Bc * HEAD_DIM + lane_smem_K_d) * sizeof(half);
-                LDMATRIX_X2(reg_K[i][0], reg_K[i][1], lane_smem_K_ptr);
-            }
+
+            // K is stored [N, K] and viewed as an 8x8 column-major B
+            // fragment: one b32 register.
             #pragma unroll
             for (int j = 0; j < NUM_MMA_PER_WARP_K_BC; ++j) {
-                HMMA16832(reg_S[0][j][0], reg_S[0][j][1], reg_S[0][j][2], reg_S[0][j][3],
-                        reg_Q[0][0], reg_Q[0][1], reg_Q[0][2], reg_Q[0][3],
+                const int tile_row =
+                    warp_KV_id * (NUM_MMA_PER_WARP_K_BC * MMA_ATOM_N) +
+                    j * MMA_ATOM_N;
+                const int lane_row = tile_row + lane_id % 8;
+                const uint32_t k_ptr = smem_K_base_ptr +
+                    lane_row * HEAD_DIM * sizeof(half);
+                LDMATRIX_X1(reg_K[j][0], k_ptr);
+                HMMA1688(
+                    reg_S[0][j][0], reg_S[0][j][1],
+                    reg_S[0][j][2], reg_S[0][j][3],
+                    reg_Q[0][0], reg_Q[0][1], reg_K[j][0],
+                    reg_S[0][j][0], reg_S[0][j][1],
+                    reg_S[0][j][2], reg_S[0][j][3]);
+            }
+        } else {
+            const int tile_k_num = HEAD_DIM / MMA_ATOM_K;
+            for (int tile_k_id = 0; tile_k_id < tile_k_num; ++tile_k_id) {
+                #pragma unroll
+                for (int i = 0; i < NUM_MMA_PER_WARP_Q_BR; ++i) {
+                    const int warp_row =
+                        warp_Q_id * (NUM_MMA_PER_WARP_Q_BR * MMA_ATOM_M) +
+                        i * MMA_ATOM_M;
+                    const int lane_row = warp_row + lane_id % 16;
+                    const int lane_d =
+                        tile_k_id * MMA_ATOM_K + (lane_id / 16) * 8;
+                    const uint32_t q_ptr = smem_Q_base_ptr +
+                        (lane_row * HEAD_DIM + lane_d) * sizeof(half);
+                    LDMATRIX_X4(
+                        reg_Q[i][0], reg_Q[i][1],
+                        reg_Q[i][2], reg_Q[i][3], q_ptr);
+                }
+                #pragma unroll
+                for (int j = 0; j < NUM_MMA_PER_WARP_K_BC; ++j) {
+                    const int tile_row =
+                        warp_KV_id *
+                            (NUM_MMA_PER_WARP_K_BC * MMA_ATOM_N) +
+                        j * MMA_ATOM_N;
+                    const int lane_row = tile_row + lane_id % 8;
+                    const int lane_d =
+                        tile_k_id * MMA_ATOM_K +
+                        ((lane_id / 8) % 2) * 8;
+                    const uint32_t k_ptr = smem_K_base_ptr +
+                        (lane_row * HEAD_DIM + lane_d) * sizeof(half);
+                    LDMATRIX_X2(reg_K[j][0], reg_K[j][1], k_ptr);
+                }
+                #pragma unroll
+                for (int j = 0; j < NUM_MMA_PER_WARP_K_BC; ++j) {
+                    HMMA16832(
+                        reg_S[0][j][0], reg_S[0][j][1],
+                        reg_S[0][j][2], reg_S[0][j][3],
+                        reg_Q[0][0], reg_Q[0][1],
+                        reg_Q[0][2], reg_Q[0][3],
                         reg_K[j][0], reg_K[j][1],
-                        reg_S[0][j][0], reg_S[0][j][1], reg_S[0][j][2], reg_S[0][j][3]);
+                        reg_S[0][j][0], reg_S[0][j][1],
+                        reg_S[0][j][2], reg_S[0][j][3]);
+                }
             }
         }
         __syncthreads();

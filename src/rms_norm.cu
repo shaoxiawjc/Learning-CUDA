@@ -11,6 +11,47 @@ union alignas(16) PackHalf8 {
 
 static constexpr size_t WARP_SIZE = 32;
 
+template<size_t threads_per_block>
+__device__ __forceinline__ float rms_inv_reduce(
+    float sum, size_t hidden_dim, float eps,
+    float* sdata, float* shared_rms_inv
+) {
+    const size_t lane_id = threadIdx.x % WARP_SIZE;
+    const size_t warp_id = threadIdx.x / WARP_SIZE;
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+
+    if constexpr (threads_per_block == WARP_SIZE) {
+        if (lane_id == 0) {
+            sum = rsqrtf(sum / static_cast<float>(hidden_dim) + eps);
+        }
+        return __shfl_sync(0xffffffff, sum, 0);
+    } else {
+        if (lane_id == 0) {
+            sdata[warp_id] = sum;
+        }
+        __syncthreads();
+        if (warp_id == 0) {
+            sum = (threadIdx.x < threads_per_block / WARP_SIZE)
+                      ? sdata[lane_id]
+                      : 0.0f;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                sum += __shfl_down_sync(0xffffffff, sum, offset);
+            }
+            if (lane_id == 0) {
+                *shared_rms_inv =
+                    rsqrtf(sum / static_cast<float>(hidden_dim) + eps);
+            }
+        }
+        __syncthreads();
+        return *shared_rms_inv;
+    }
+}
+
 template<size_t threads_per_block, size_t items_per_thread = 0>
 __global__ void rms_norm_fp32_kernel(
     const float* __restrict__ input,
@@ -22,8 +63,6 @@ __global__ void rms_norm_fp32_kernel(
 
     size_t num_vecs = hidden_dim / vec_size;
     size_t tid = threadIdx.x;
-    size_t lane_id = threadIdx.x % WARP_SIZE;
-    size_t warp_id = threadIdx.x / WARP_SIZE;
     size_t row = blockIdx.x;
 
     const float* row_input = input + row * hidden_dim;
@@ -57,27 +96,8 @@ __global__ void rms_norm_fp32_kernel(
         }
     }
 
-    // warp reduce
-    #pragma unroll
-    for (int i = 16 ; i > 0; i /= 2) {
-        sum += __shfl_down_sync(0xffffffff, sum, i);
-    }
-
-    if (lane_id == 0) {
-        sdata[warp_id] = sum;
-    }
-    __syncthreads();
-    if (warp_id == 0) {
-        sum = (threadIdx.x < blockDim.x / WARP_SIZE) ? sdata[lane_id] : 0.0f;
-        #pragma unroll
-        for (int i = 16 ; i > 0; i /= 2){
-            sum += __shfl_down_sync(0xffffffff, sum, i);
-        }
-        if (lane_id == 0) {
-            rms_inv = rsqrtf(sum / static_cast<float>(hidden_dim) + eps);
-        }
-    }
-    __syncthreads();
+    const float row_rms_inv = rms_inv_reduce<threads_per_block>(
+        sum, hidden_dim, eps, sdata, &rms_inv);
 
     if constexpr (items_per_thread > 0) {
         #pragma unroll
@@ -87,10 +107,10 @@ __global__ void rms_norm_fp32_kernel(
                 const float4 val = cached_input[item];
                 const float4 w = weight_vec[i];
                 float4 out;
-                out.x = val.x * rms_inv * w.x;
-                out.y = val.y * rms_inv * w.y;
-                out.z = val.z * rms_inv * w.z;
-                out.w = val.w * rms_inv * w.w;
+                out.x = val.x * row_rms_inv * w.x;
+                out.y = val.y * row_rms_inv * w.y;
+                out.z = val.z * row_rms_inv * w.z;
+                out.w = val.w * row_rms_inv * w.w;
                 row_output_vec[i] = out;
             }
         }
@@ -99,10 +119,10 @@ __global__ void rms_norm_fp32_kernel(
             const float4 val = row_input_vec[i];
             const float4 w = weight_vec[i];
             float4 out;
-            out.x = val.x * rms_inv * w.x;
-            out.y = val.y * rms_inv * w.y;
-            out.z = val.z * rms_inv * w.z;
-            out.w = val.w * rms_inv * w.w;
+            out.x = val.x * row_rms_inv * w.x;
+            out.y = val.y * row_rms_inv * w.y;
+            out.z = val.z * row_rms_inv * w.z;
+            out.w = val.w * row_rms_inv * w.w;
             row_output_vec[i] = out;
         }
     }
@@ -120,8 +140,6 @@ __global__ void rms_norm_fp16_kernel(
 
     size_t num_vecs = hidden_dim / vec_size;
     size_t tid = threadIdx.x;
-    size_t lane_id = threadIdx.x % WARP_SIZE;
-    size_t warp_id = threadIdx.x / WARP_SIZE;
     size_t row = blockIdx.x;
     if (row >= rows) return;
 
@@ -166,27 +184,8 @@ __global__ void rms_norm_fp16_kernel(
         }
     }
 
-    // warp reduce
-    #pragma unroll
-    for (int i = 16 ; i > 0; i /= 2) {
-        sum += __shfl_down_sync(0xffffffff, sum, i);
-    }
-
-    if (lane_id == 0) {
-        sdata[warp_id] = sum;
-    }
-    __syncthreads();
-    if (warp_id == 0) {
-        sum = (threadIdx.x < blockDim.x / WARP_SIZE) ? sdata[lane_id] : 0.0f;
-        #pragma unroll
-        for (int i = 16 ; i > 0; i /= 2){
-            sum += __shfl_down_sync(0xffffffff, sum, i);
-        }
-        if (lane_id == 0) {
-            rms_inv = rsqrtf(sum / static_cast<float>(hidden_dim) + eps);
-        }
-    }
-    __syncthreads();
+    const float row_rms_inv = rms_inv_reduce<threads_per_block>(
+        sum, hidden_dim, eps, sdata, &rms_inv);
 
     if constexpr (items_per_thread > 0) {
         #pragma unroll
@@ -203,8 +202,8 @@ __global__ void rms_norm_fp16_kernel(
                     const float2 value_f = __half22float2(val.data[j]);
                     const float2 scale_f = __half22float2(w.data[j]);
                     out.data[j] = __floats2half2_rn(
-                        value_f.x * rms_inv * scale_f.x,
-                        value_f.y * rms_inv * scale_f.y
+                        value_f.x * row_rms_inv * scale_f.x,
+                        value_f.y * row_rms_inv * scale_f.y
                     );
                 }
                 LDST128BITS(row_output[i * vec_size]) = out.packed;
@@ -222,8 +221,8 @@ __global__ void rms_norm_fp16_kernel(
                 const float2 value_f = __half22float2(val.data[j]);
                 const float2 scale_f = __half22float2(w.data[j]);
                 out.data[j] = __floats2half2_rn(
-                    value_f.x * rms_inv * scale_f.x,
-                    value_f.y * rms_inv * scale_f.y
+                    value_f.x * row_rms_inv * scale_f.x,
+                    value_f.y * row_rms_inv * scale_f.y
                 );
             }
             LDST128BITS(row_output[i * vec_size]) = out.packed;

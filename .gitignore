@@ -5,6 +5,7 @@ test_kernels
 # Benchmark environment and output
 .venv/
 __pycache__/
+third_party/flash-attention/
 benchmark_baseline.json
 benchmark_comparison.png
 benchmark_comparison_*.png

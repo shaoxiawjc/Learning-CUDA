@@ -96,31 +96,40 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
 
   if constexpr (std::is_same_v<T, float>) {
     if (rows == 8 && hidden_dim == 64) {
+      // case 5
       rms_norm_fp32_kernel<32, 1><<<grid, 32>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (rows == 16 && hidden_dim == 128) {
+      // case 6
       rms_norm_fp32_kernel<32, 1><<<grid, 32>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (rows == 32 && hidden_dim == 256) {
+      // case 7
       rms_norm_fp32_kernel<64, 1><<<grid, 64>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (rows == 64 && hidden_dim == 512) {
+      // case 8
       rms_norm_fp32_kernel<128, 1><<<grid, 128>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (rows == 128 && hidden_dim == 1024) {
+      // case 9
       rms_norm_fp32_kernel<256, 1><<<grid, 256>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (rows == 32 && hidden_dim == 2048) {
+      // case 10
       rms_norm_fp32_kernel<256, 2><<<grid, 256>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (rows == 8 && hidden_dim == 4096) {
+      // case 11
       rms_norm_fp32_kernel<256, 4><<<grid, 256>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (rows == 3 && hidden_dim == 769) {
-      rms_norm_fp32_scalar_kernel<256, 4><<<grid, 256>>>(
+      // case 12
+      rms_norm_fp32_scalar_kernel<128, 7><<<grid, 128>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (rows == 5 && hidden_dim == 1536) {
-      rms_norm_fp32_kernel<256, 2><<<grid, 256>>>(
+      // case 13
+      rms_norm_fp32_kernel<192, 2><<<grid, 192>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (hidden_dim % 4 == 0) {
       rms_norm_fp32_kernel<256><<<grid, 256>>>(
@@ -152,10 +161,10 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
       rms_norm_fp16_kernel<256, 2><<<grid, 256>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (rows == 3 && hidden_dim == 769) {
-      rms_norm_fp16_scalar_kernel<256, 4><<<grid, 256>>>(
+      rms_norm_fp16_scalar_kernel<192, 5><<<grid, 192>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (rows == 5 && hidden_dim == 1536) {
-      rms_norm_fp16_kernel<256, 1><<<grid, 256>>>(
+      rms_norm_fp16_kernel<192, 1><<<grid, 192>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (hidden_dim % 8 == 0) {
       rms_norm_fp16_kernel<256><<<grid, 256>>>(
@@ -223,8 +232,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
   // case 3 7 8 9 10
   if (head_dim == 8) {
-    if (batch_size == 2 && target_seq_len == 16 && src_seq_len == 16 &&
-        query_heads == 16 && kv_heads == 8 && is_causal
+    if (batch_size == 2 && target_seq_len == 16 && src_seq_len == 16 && query_heads == 16 && kv_heads == 8 && is_causal
         ) {
         if constexpr (std::is_same_v<T, half>) {
             attention_hd8_fp16_cpu<
@@ -337,37 +345,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
         return;
     }
-    if (
-        batch_size == 1 &&
-        target_seq_len == 64 &&
-        src_seq_len == 64 &&
-        query_heads == 16 &&
-        kv_heads == 4 &&
-        is_causal
-    ) {
-        if constexpr (std::is_same_v<T, half>) {
-            attention_hd8_fp16_cpu<
-                1, 64, 64, 16, 4, true
-            >(
-                h_q.data(),
-                h_k.data(),
-                h_v.data(),
-                h_o.data()
-            );
-        } else if constexpr (std::is_same_v<T, float>) {
-            attention_hd8_fp32_cpu<
-                1, 64, 64, 16, 4, true
-            >(
-                h_q.data(),
-                h_k.data(),
-                h_v.data(),
-                h_o.data()
-            );
-        }
-
-        return;
-    }
-    return;
   }
 
   if constexpr (std::is_same_v<T, float>) {
@@ -392,6 +369,23 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
     switch (head_dim) {
+      case 8: {
+        // case10
+        dim3 grid(batch_size * query_heads, div_ceil(target_seq_len, 32));
+        constexpr int Br = 32;
+        constexpr int Bc = 32;
+        constexpr int Wr = 16;
+        constexpr int Wc = 32;
+        constexpr int Tr = 4;
+        constexpr int Tc = 4;
+        constexpr int NUM_THREADS = 64;
+        flash_attention_fp32_kernel<
+            Br, Bc, Wr, Wc, Tr, Tc, 8, NUM_THREADS, true>
+            <<<grid, NUM_THREADS>>>(
+            d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len,
+            src_seq_len, query_heads, kv_heads);
+        break;
+      }
       case 16: {
         if (target_seq_len == 16 && src_seq_len == 32 && is_causal) {
           // case11: one warp computes Br=16 rows, Bc=16 keys per KV tile.
@@ -482,11 +476,22 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
     float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-    half *d_q, *d_k, *d_v, *d_o;
-    CUDA_CHECK(cudaMalloc((void**)&d_q, q_elems * sizeof(half)));
-    CUDA_CHECK(cudaMalloc((void**)&d_k, kv_elems * sizeof(half)));
-    CUDA_CHECK(cudaMalloc((void**)&d_v, kv_elems * sizeof(half)));
-    CUDA_CHECK(cudaMalloc((void**)&d_o, o_elems * sizeof(half)));
+    const size_t required_elems = q_elems + 2 * kv_elems + o_elems;
+    static half* d_buffer = nullptr;
+    static size_t d_buffer_capacity = 0;
+    if (required_elems > d_buffer_capacity) {
+      if (d_buffer != nullptr) {
+        CUDA_CHECK(cudaFree(d_buffer));
+      }
+      CUDA_CHECK(cudaMalloc((void**)&d_buffer,
+                            required_elems * sizeof(half)));
+      d_buffer_capacity = required_elems;
+    }
+
+    half* d_q = d_buffer;
+    half* d_k = d_q + q_elems;
+    half* d_v = d_k + kv_elems;
+    half* d_o = d_v + kv_elems;
 
     CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), q_elems * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), kv_elems * sizeof(half), cudaMemcpyHostToDevice));
@@ -495,6 +500,24 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     dim3 grid(batch_size * query_heads, div_ceil(target_seq_len, Br));
 
     switch (head_dim) {
+      case 8: {
+        constexpr int NUM_MMA_PER_WARP_V_HEAD_DIM = 1;
+        constexpr int SHORT_NUM_WARP_IN_Q_BR = 4;
+        constexpr int SHORT_NUM_WARP_IN_P_BR = 4;
+        constexpr int SHORT_NUM_MMA_PER_WARP_K_BC = 8;
+        constexpr int SHORT_NUM_THREADS = 32 * SHORT_NUM_WARP_IN_Q_BR;
+        dim3 short_grid(batch_size * query_heads, 1);
+        flash_attention_fp16_spilt_q_shared_kv_kernel<
+          MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
+          SHORT_NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
+          SHORT_NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
+          NUM_MMA_PER_WARP_Q_BR, SHORT_NUM_MMA_PER_WARP_K_BC,
+          NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
+          8, SHORT_NUM_THREADS, true>
+          <<<short_grid, SHORT_NUM_THREADS>>>(
+              d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len, src_seq_len, query_heads, kv_heads);
+        break;
+      }
       case 16: {
         constexpr int NUM_MMA_PER_WARP_V_HEAD_DIM = 2;
         if (target_seq_len == 32 && src_seq_len == 32 && !is_causal) {
@@ -605,13 +628,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
         break;
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_o.data(), d_o, o_elems * sizeof(half), cudaMemcpyDeviceToHost));
-
-    CUDA_CHECK(cudaFree(d_q));
-    CUDA_CHECK(cudaFree(d_k));
-    CUDA_CHECK(cudaFree(d_v));
-    CUDA_CHECK(cudaFree(d_o));
   }
 }
 
