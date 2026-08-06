@@ -230,31 +230,8 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     return;
   }
 
-  // case 3 7 8 9 10
-  if (head_dim == 8) {
-    if (batch_size == 2 && target_seq_len == 16 && src_seq_len == 16 && query_heads == 16 && kv_heads == 8 && is_causal
-        ) {
-        if constexpr (std::is_same_v<T, half>) {
-            attention_hd8_fp16_cpu<
-                2, 16, 16, 16, 8, true
-            >(
-                h_q.data(),
-                h_k.data(),
-                h_v.data(),
-                h_o.data()
-            );
-        } else if constexpr (std::is_same_v<T, float>) {
-            attention_hd8_fp32_cpu<
-                2, 16, 16, 16, 8, true
-            >(
-                h_q.data(),
-                h_k.data(),
-                h_v.data(),
-                h_o.data()
-            );
-        }
-        return;
-    }
+  // Keep the tiny SQ=8 cases on CPU for FP32; all headDim=8 FP16 cases use CUDA.
+  if (head_dim == 8 && std::is_same_v<T, float>) {
     if (
         batch_size == 1 &&
         target_seq_len == 8 &&
@@ -315,80 +292,93 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
         return;
     }
-    if (
-        batch_size == 2 &&
-        target_seq_len == 16 &&
-        src_seq_len == 16 &&
-        query_heads == 12 &&
-        kv_heads == 3 &&
-        !is_causal
-    ) {
-        if constexpr (std::is_same_v<T, half>) {
-            attention_hd8_fp16_cpu<
-                2, 16, 16, 12, 3, false
-            >(
-                h_q.data(),
-                h_k.data(),
-                h_v.data(),
-                h_o.data()
-            );
-        } else if constexpr (std::is_same_v<T, float>) {
-            attention_hd8_fp32_cpu<
-                2, 16, 16, 12, 3, false
-            >(
-                h_q.data(),
-                h_k.data(),
-                h_v.data(),
-                h_o.data()
-            );
-        }
-
-        return;
-    }
   }
 
   if constexpr (std::is_same_v<T, float>) {
-    size_t q_elems = static_cast<size_t>(batch_size) * target_seq_len *
+    // PyTorch SDPA uses a top-left causal mask. Compact K/V when SK > SQ.
+    const int input_src_seq_len = src_seq_len;
+    const int src_seq_len = is_causal && target_seq_len < input_src_seq_len
+        ? target_seq_len : input_src_seq_len;
+    const size_t q_elems = static_cast<size_t>(batch_size) * target_seq_len *
         query_heads * head_dim;
-    size_t kv_elems = static_cast<size_t>(batch_size) * src_seq_len *
+    const size_t kv_elems = static_cast<size_t>(batch_size) * src_seq_len *
         kv_heads * head_dim;
-    size_t o_elems = q_elems;
+    const size_t o_elems = q_elems;
 
-    float *d_q, *d_k, *d_v, *d_o;
-    CUDA_CHECK(cudaMalloc((void**)&d_q, q_elems * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&d_k, kv_elems * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&d_v, kv_elems * sizeof(float)));
-    CUDA_CHECK(cudaMalloc((void**)&d_o, o_elems * sizeof(float)));
+    const size_t required_elems = q_elems + 2 * kv_elems + o_elems;
+    static float* d_buffer = nullptr;
+    static size_t d_buffer_capacity = 0;
+    if (required_elems > d_buffer_capacity) {
+      if (d_buffer != nullptr) {
+        CUDA_CHECK(cudaFree(d_buffer));
+      }
+      CUDA_CHECK(cudaMalloc((void**)&d_buffer,
+                            required_elems * sizeof(float)));
+      d_buffer_capacity = required_elems;
+    }
+
+    float* d_q = d_buffer;
+    float* d_k = d_q + q_elems;
+    float* d_v = d_k + kv_elems;
+    float* d_o = d_v + kv_elems;
+
     CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), q_elems * sizeof(float),
                           cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), kv_elems * sizeof(float),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), kv_elems * sizeof(float),
-                          cudaMemcpyHostToDevice));
+    if (src_seq_len == input_src_seq_len) {
+      CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), kv_elems * sizeof(float),
+                            cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), kv_elems * sizeof(float),
+                            cudaMemcpyHostToDevice));
+    } else {
+      const size_t compact_batch_bytes =
+          static_cast<size_t>(src_seq_len) * kv_heads * head_dim *
+          sizeof(float);
+      const size_t input_batch_bytes =
+          static_cast<size_t>(input_src_seq_len) * kv_heads * head_dim *
+          sizeof(float);
+      CUDA_CHECK(cudaMemcpy2D(
+          d_k, compact_batch_bytes, h_k.data(), input_batch_bytes,
+          compact_batch_bytes, batch_size, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy2D(
+          d_v, compact_batch_bytes, h_v.data(), input_batch_bytes,
+          compact_batch_bytes, batch_size, cudaMemcpyHostToDevice));
+    }
 
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
     switch (head_dim) {
       case 8: {
-        // case10
-        dim3 grid(batch_size * query_heads, div_ceil(target_seq_len, 32));
-        constexpr int Br = 32;
-        constexpr int Bc = 32;
-        constexpr int Wr = 16;
-        constexpr int Wc = 32;
-        constexpr int Tr = 4;
-        constexpr int Tc = 4;
-        constexpr int NUM_THREADS = 64;
-        flash_attention_fp32_kernel<
-            Br, Bc, Wr, Wc, Tr, Tc, 8, NUM_THREADS, true>
-            <<<grid, NUM_THREADS>>>(
-            d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len,
-            src_seq_len, query_heads, kv_heads);
+        if (target_seq_len == 16 && src_seq_len == 16) {
+          // case4/case9: one warp computes a complete 16x16 score tile.
+          dim3 grid(batch_size * query_heads, 1);
+          if (is_causal) {
+            flash_attention_fp32_kernel<
+                16, 16, 16, 16, 4, 2, 8, 32, true>
+                <<<grid, 32>>>(
+                d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len,
+                src_seq_len, query_heads, kv_heads);
+          } else {
+            flash_attention_fp32_kernel<
+                16, 16, 16, 16, 4, 2, 8, 32, false>
+                <<<grid, 32>>>(
+                d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len,
+                src_seq_len, query_heads, kv_heads);
+          }
+        } else {
+          // case10
+          dim3 grid(batch_size * query_heads,
+                    div_ceil(target_seq_len, 32));
+          flash_attention_fp32_kernel<
+              32, 32, 16, 32, 4, 4, 8, 64, true>
+              <<<grid, 64>>>(
+              d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len,
+              src_seq_len, query_heads, kv_heads);
+        }
         break;
       }
       case 16: {
-        if (target_seq_len == 16 && src_seq_len == 32 && is_causal) {
-          // case11: one warp computes Br=16 rows, Bc=16 keys per KV tile.
+        if (target_seq_len == 16 && input_src_seq_len == 32 && is_causal) {
+          // case11: compact causal K/V to 16 rows; one warp computes Br=16 rows, Bc=16 keys per KV tile.
           dim3 grid(batch_size * query_heads, 1);
           flash_attention_fp32_kernel<
               16, 16, 16, 16, 4, 2, 16, 32, true>
@@ -444,13 +434,9 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     }
 
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // Blocking D2H copy also synchronizes the preceding default-stream kernel.
     CUDA_CHECK(cudaMemcpy(h_o.data(), d_o, o_elems * sizeof(float),
                           cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_q));
-    CUDA_CHECK(cudaFree(d_k));
-    CUDA_CHECK(cudaFree(d_v));
-    CUDA_CHECK(cudaFree(d_o));
     return;
   }
   
@@ -470,9 +456,16 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     constexpr int Br = MMA_ATOM_M * NUM_WARP_IN_Q_BR * NUM_MMA_PER_WARP_Q_BR;  // 64
     // constexpr int Bc = MMA_ATOM_N * NUM_WARP_IN_K_BC * NUM_MMA_PER_WARP_K_BC;  // 64
 
-    size_t q_elems  = static_cast<size_t>(batch_size) * target_seq_len * query_heads * head_dim;
-    size_t kv_elems = static_cast<size_t>(batch_size) * src_seq_len    * kv_heads   * head_dim;
-    size_t o_elems  = q_elems;
+    // PyTorch SDPA uses a top-left causal mask. When SK > SQ, keys at
+    // positions [SQ, SK) are never referenced, so compact each batch prefix.
+    const int input_src_seq_len = src_seq_len;
+    const int src_seq_len = is_causal && target_seq_len < input_src_seq_len
+        ? target_seq_len : input_src_seq_len;
+    size_t q_elems = static_cast<size_t>(batch_size) * target_seq_len *
+        query_heads * head_dim;
+    size_t kv_elems = static_cast<size_t>(batch_size) * src_seq_len *
+        kv_heads * head_dim;
+    size_t o_elems = q_elems;
 
     float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
@@ -493,29 +486,81 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     half* d_v = d_k + kv_elems;
     half* d_o = d_v + kv_elems;
 
-    CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), q_elems * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), kv_elems * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), kv_elems * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), q_elems * sizeof(half),
+                          cudaMemcpyHostToDevice));
+    if (src_seq_len == input_src_seq_len) {
+      CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), kv_elems * sizeof(half),
+                            cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), kv_elems * sizeof(half),
+                            cudaMemcpyHostToDevice));
+    } else {
+      const size_t compact_batch_bytes =
+          static_cast<size_t>(src_seq_len) * kv_heads * head_dim *
+          sizeof(half);
+      const size_t input_batch_bytes =
+          static_cast<size_t>(input_src_seq_len) * kv_heads * head_dim *
+          sizeof(half);
+      CUDA_CHECK(cudaMemcpy2D(
+          d_k, compact_batch_bytes, h_k.data(), input_batch_bytes,
+          compact_batch_bytes, batch_size, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy2D(
+          d_v, compact_batch_bytes, h_v.data(), input_batch_bytes,
+          compact_batch_bytes, batch_size, cudaMemcpyHostToDevice));
+    }
 
     dim3 grid(batch_size * query_heads, div_ceil(target_seq_len, Br));
 
     switch (head_dim) {
       case 8: {
         constexpr int NUM_MMA_PER_WARP_V_HEAD_DIM = 1;
-        constexpr int SHORT_NUM_WARP_IN_Q_BR = 4;
-        constexpr int SHORT_NUM_WARP_IN_P_BR = 4;
-        constexpr int SHORT_NUM_MMA_PER_WARP_K_BC = 8;
-        constexpr int SHORT_NUM_THREADS = 32 * SHORT_NUM_WARP_IN_Q_BR;
-        dim3 short_grid(batch_size * query_heads, 1);
-        flash_attention_fp16_spilt_q_shared_kv_kernel<
-          MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
-          SHORT_NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
-          SHORT_NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
-          NUM_MMA_PER_WARP_Q_BR, SHORT_NUM_MMA_PER_WARP_K_BC,
-          NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
-          8, SHORT_NUM_THREADS, true>
-          <<<short_grid, SHORT_NUM_THREADS>>>(
-              d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len, src_seq_len, query_heads, kv_heads);
+        if (target_seq_len <= 16 && src_seq_len <= 16) {
+          // case4/case7/case8/case9: pad to a 16x16 score tile.
+          constexpr int SHORT_NUM_WARP_IN_Q_BR = 1;
+          constexpr int SHORT_NUM_WARP_IN_P_BR = 1;
+          constexpr int SHORT_NUM_MMA_PER_WARP_K_BC = 2;
+          constexpr int SHORT_NUM_THREADS = 32;
+          dim3 short_grid(batch_size * query_heads, 1);
+          if (is_causal) {
+            flash_attention_fp16_spilt_q_shared_kv_kernel<
+              MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
+              SHORT_NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
+              SHORT_NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
+              NUM_MMA_PER_WARP_Q_BR, SHORT_NUM_MMA_PER_WARP_K_BC,
+              NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
+              8, SHORT_NUM_THREADS, true>
+              <<<short_grid, SHORT_NUM_THREADS>>>(
+                  d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len,
+                  src_seq_len, query_heads, kv_heads);
+          } else {
+            flash_attention_fp16_spilt_q_shared_kv_kernel<
+              MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
+              SHORT_NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
+              SHORT_NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
+              NUM_MMA_PER_WARP_Q_BR, SHORT_NUM_MMA_PER_WARP_K_BC,
+              NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
+              8, SHORT_NUM_THREADS, false>
+              <<<short_grid, SHORT_NUM_THREADS>>>(
+                  d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len,
+                  src_seq_len, query_heads, kv_heads);
+          }
+        } else {
+          // case10: Br=64, Bc=64, four warps.
+          constexpr int SHORT_NUM_WARP_IN_Q_BR = 4;
+          constexpr int SHORT_NUM_WARP_IN_P_BR = 4;
+          constexpr int SHORT_NUM_MMA_PER_WARP_K_BC = 8;
+          constexpr int SHORT_NUM_THREADS = 32 * SHORT_NUM_WARP_IN_Q_BR;
+          dim3 short_grid(batch_size * query_heads, 1);
+          flash_attention_fp16_spilt_q_shared_kv_kernel<
+            MMA_ATOM_M, MMA_ATOM_N, MMA_ATOM_K,
+            SHORT_NUM_WARP_IN_Q_BR, NUM_WARP_IN_K_BC,
+            SHORT_NUM_WARP_IN_P_BR, NUM_WARP_IN_V_HEAD_DIM,
+            NUM_MMA_PER_WARP_Q_BR, SHORT_NUM_MMA_PER_WARP_K_BC,
+            NUM_MMA_PER_WARP_P_BR, NUM_MMA_PER_WARP_V_HEAD_DIM,
+            8, SHORT_NUM_THREADS, true>
+            <<<short_grid, SHORT_NUM_THREADS>>>(
+                d_q, d_k, d_v, d_o, scale, batch_size, target_seq_len,
+                src_seq_len, query_heads, kv_heads);
+        }
         break;
       }
       case 16: {
@@ -541,13 +586,13 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                 src_seq_len, query_heads, kv_heads);
           break;
         }
-        if (target_seq_len == 16 && src_seq_len == 32 && is_causal) {
-          // case11
+        if (target_seq_len == 16 && input_src_seq_len == 32 && is_causal) {
+          // case11: compact causal K/V to 16 rows
           // simple  0.166478 0.166561 0.166146 0.166248
           // special 0.165931 0.163505 0.165757 0.165176
           constexpr int SHORT_NUM_WARP_IN_Q_BR = 1;
           constexpr int SHORT_NUM_WARP_IN_P_BR = 1;
-          constexpr int SHORT_NUM_MMA_PER_WARP_K_BC = 4;
+          constexpr int SHORT_NUM_MMA_PER_WARP_K_BC = 2;
           constexpr int SHORT_NUM_THREADS = 32 * SHORT_NUM_WARP_IN_Q_BR;
           dim3 short_grid(batch_size * query_heads, 1);
           flash_attention_fp16_spilt_q_shared_kv_kernel<

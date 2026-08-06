@@ -10,10 +10,10 @@
 #     --plot-file rms_norm_compare.png \
 #     --baseline-file data/rms_norm_baseline_v2.json
 
-# python benchmark.py --runs 50 \
+# python benchmark.py --runs 2 \
 #     --operator attention \
 #     --baseline \
-#     --baseline-file data/attention_baseline.json
+#     --baseline-file data/attention_baseline_v2.json
 
 # Official Dao-AILab FlashAttention baseline (fp16, cases 4-14).
 # Requires third_party/flash-attention and an installed flash-attn CUDA extension.
@@ -26,4 +26,4 @@ python benchmark.py \
     --operator attention \
     --plot \
     --plot-file attention_compare.png \
-    --baseline-file data/attention_flash_attn_baseline.json
+    --baseline-file data/attention_baseline_v2.json
