@@ -74,8 +74,6 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
   size_t weight_bytes = hidden_dim * sizeof(T);
   size_t required_bytes = in_out_bytes * 2 + weight_bytes;
 
-  // One process-lifetime cache per T. The tester calls this function
-  // serially and repeatedly, so profile iterations avoid malloc/free.
   static void* d_buffer = nullptr;
   static size_t d_buffer_capacity = 0;
   if (required_bytes > d_buffer_capacity) {
@@ -230,72 +228,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     return;
   }
 
-  // Keep the tiny SQ=8 cases on CPU for FP32; all headDim=8 FP16 cases use CUDA.
-  if (head_dim == 8 && std::is_same_v<T, float>) {
-    if (
-        batch_size == 1 &&
-        target_seq_len == 8 &&
-        src_seq_len == 8 &&
-        query_heads == 8 &&
-        kv_heads == 2 &&
-        !is_causal
-    ) {
-        if constexpr (std::is_same_v<T, half>) {
-            attention_hd8_fp16_cpu<
-                1, 8, 8, 8, 2, false
-            >(
-                h_q.data(),
-                h_k.data(),
-                h_v.data(),
-                h_o.data()
-            );
-        } else if constexpr (std::is_same_v<T, float>) {
-            attention_hd8_fp32_cpu<
-                1, 8, 8, 8, 2, false
-            >(
-                h_q.data(),
-                h_k.data(),
-                h_v.data(),
-                h_o.data()
-            );
-        }
-
-        return;
-    }
-    if (
-        batch_size == 1 &&
-        target_seq_len == 8 &&
-        src_seq_len == 8 &&
-        query_heads == 8 &&
-        kv_heads == 2 &&
-        is_causal
-    ) {
-        if constexpr (std::is_same_v<T, half>) {
-            attention_hd8_fp16_cpu<
-                1, 8, 8, 8, 2, true
-            >(
-                h_q.data(),
-                h_k.data(),
-                h_v.data(),
-                h_o.data()
-            );
-        } else if constexpr (std::is_same_v<T, float>) {
-            attention_hd8_fp32_cpu<
-                1, 8, 8, 8, 2, true
-            >(
-                h_q.data(),
-                h_k.data(),
-                h_v.data(),
-                h_o.data()
-            );
-        }
-
-        return;
-    }
-  }
-
   if constexpr (std::is_same_v<T, float>) {
-    // PyTorch SDPA uses a top-left causal mask. Compact K/V when SK > SQ.
     const int input_src_seq_len = src_seq_len;
     const int src_seq_len = is_causal && target_seq_len < input_src_seq_len
         ? target_seq_len : input_src_seq_len;
@@ -348,8 +281,8 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
     switch (head_dim) {
       case 8: {
-        if (target_seq_len == 16 && src_seq_len == 16) {
-          // case4/case9: one warp computes a complete 16x16 score tile.
+        if (target_seq_len <= 16 && src_seq_len <= 16) {
+          // case4/case7/case8/case9: pad to one 16x16 score tile.
           dim3 grid(batch_size * query_heads, 1);
           if (is_causal) {
             flash_attention_fp32_kernel<
