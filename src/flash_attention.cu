@@ -531,6 +531,24 @@ __global__ void flash_attention_fp16_spilt_q_shared_kv_kernel(
 }
 
 
+template<const int HEAD_DIM>
+__device__ __forceinline__ int swizzle_fp32_float4_d(
+    const int logical_d,
+    const int group_id
+) {
+    constexpr int NUM_FLOAT4_CHUNKS = HEAD_DIM / 4;
+    static_assert(HEAD_DIM % 4 == 0, "HEAD_DIM must be float4 aligned");
+    static_assert(
+        (NUM_FLOAT4_CHUNKS & (NUM_FLOAT4_CHUNKS - 1)) == 0,
+        "HEAD_DIM / 4 must be a power of two"
+    );
+    const int logical_chunk = logical_d / 4;
+    const int physical_chunk =
+        logical_chunk ^ (group_id & (NUM_FLOAT4_CHUNKS - 1));
+    return physical_chunk * 4;
+}
+
+
 
 template<
     const int Br,
@@ -567,7 +585,7 @@ __global__ void flash_attention_fp32_kernel(
     const int NUM_WARP_N = Bc / Wc;
     const int warp_m_id = warp_id / NUM_WARP_N;
     const int warp_n_id = warp_id % NUM_WARP_N;
-    // const int NUM_THREADS_PER_WARP_M = Wr / Tr;
+    constexpr int NUM_THREADS_PER_WARP_M = Wr / Tr;
     const int NUM_THREADS_PER_WARP_N = Wc / Tc;
     const int lane_m_id = lane_id / NUM_THREADS_PER_WARP_N;
     const int lane_n_id = lane_id % NUM_THREADS_PER_WARP_N; // must be 0
@@ -593,18 +611,23 @@ __global__ void flash_attention_fp32_kernel(
         const int load_Q_smem_d = (tid % (NUM_THREADS / Br)) * (HEAD_DIM / (NUM_THREADS / Br));
 
         const int load_Q_gmem_Br = tile_Br_id * Br + load_Q_smem_Br;
-        const int load_Q_gmem_d = load_Q_smem_d;
         #pragma unroll
         for (int i = 0 ; i < (HEAD_DIM / (NUM_THREADS / Br)); i += 4) {
-            uint32_t load_Q_smem_ptr = smem_Q_base_ptr + (load_Q_smem_Br * HEAD_DIM + load_Q_smem_d + i) * sizeof(float);
+            const int logical_d = load_Q_smem_d + i;
+            const int q_group =
+                load_Q_smem_Br % NUM_THREADS_PER_WARP_M;
+            const int physical_d =
+                swizzle_fp32_float4_d<HEAD_DIM>(logical_d, q_group);
+            uint32_t load_Q_smem_ptr = smem_Q_base_ptr +
+                (load_Q_smem_Br * HEAD_DIM + physical_d) * sizeof(float);
             if (load_Q_gmem_Br < target_seq_len) {
                 const int load_Q_gmem_offset =
                     batch_id * target_seq_len * query_heads * HEAD_DIM +
                     load_Q_gmem_Br * query_heads * HEAD_DIM +
-                    head_q_id * HEAD_DIM + load_Q_gmem_d + i;
+                    head_q_id * HEAD_DIM + logical_d;
                 CP_ASYNC_CG(load_Q_smem_ptr, &Q[load_Q_gmem_offset], 16);
             } else {
-                LDST128BITS(smem_Q[load_Q_smem_Br][load_Q_smem_d + i]) =
+                LDST128BITS(smem_Q[load_Q_smem_Br][physical_d]) =
                     make_float4(0.f, 0.f, 0.f, 0.f);
             }
         }
@@ -642,18 +665,22 @@ __global__ void flash_attention_fp32_kernel(
             const int load_K_smem_Bc = tid / (NUM_THREADS / Bc);
             const int load_K_smem_d = (tid % (NUM_THREADS / Bc)) * (HEAD_DIM / (NUM_THREADS / Bc));
             const int load_K_gmem_Bc = tile_N_id * Bc + load_K_smem_Bc;
-            const int load_K_gmem_d = load_K_smem_d;
             #pragma unroll
             for (int i = 0 ; i < (HEAD_DIM / (NUM_THREADS / Bc)); i += 4) {
-                uint32_t load_K_smem_ptr = smem_K_base_ptr + (load_K_smem_Bc * HEAD_DIM + load_K_smem_d + i) * sizeof(float);
+                const int logical_d = load_K_smem_d + i;
+                const int k_group = load_K_smem_Bc / Tc;
+                const int physical_d =
+                    swizzle_fp32_float4_d<HEAD_DIM>(logical_d, k_group);
+                uint32_t load_K_smem_ptr = smem_K_base_ptr +
+                    (load_K_smem_Bc * HEAD_DIM + physical_d) * sizeof(float);
                 if (load_K_gmem_Bc < src_seq_len) {
                     const int load_K_gmem_offset =
                         batch_id * src_seq_len * kv_heads * HEAD_DIM +
                         load_K_gmem_Bc * kv_heads * HEAD_DIM +
-                        head_kv_id * HEAD_DIM + load_K_gmem_d + i;
+                        head_kv_id * HEAD_DIM + logical_d;
                     CP_ASYNC_CG(load_K_smem_ptr, &K[load_K_gmem_offset], 16);
                 } else {
-                    LDST128BITS(smem_K[load_K_smem_Bc][load_K_smem_d + i]) =
+                    LDST128BITS(smem_K[load_K_smem_Bc][physical_d]) =
                         make_float4(0.f, 0.f, 0.f, 0.f);
                 }
             }
@@ -699,15 +726,26 @@ __global__ void flash_attention_fp32_kernel(
         for (int k = 0 ; k < HEAD_DIM ; k += 4) {
             #pragma unroll
             for (int i = 0 ; i < Tr ; ++i) {
-                int local_m = warp_m_id * Wr + lane_m_id * Tr + i;
-                int local_k = k;
-                reg_Q[i] = *reinterpret_cast<float4*>(&smem_Q[local_m][local_k]);
+                const int local_m =
+                    warp_m_id * Wr + lane_m_id +
+                    i * NUM_THREADS_PER_WARP_M;
+                const int physical_k = swizzle_fp32_float4_d<HEAD_DIM>(
+                    k, local_m % NUM_THREADS_PER_WARP_M
+                );
+                reg_Q[i] = *reinterpret_cast<float4*>(
+                    &smem_Q[local_m][physical_k]
+                );
             }
             #pragma unroll
             for (int j = 0 ; j < Tc ; ++j) {
-                int local_n = warp_n_id * Wc + lane_n_id * Tc + j;
-                int local_k = k;
-                reg_K[j] = *reinterpret_cast<float4*>(&smem_K[local_n][local_k]);
+                const int local_n =
+                    warp_n_id * Wc + lane_n_id * Tc + j;
+                const int physical_k = swizzle_fp32_float4_d<HEAD_DIM>(
+                    k, local_n / Tc
+                );
+                reg_K[j] = *reinterpret_cast<float4*>(
+                    &smem_K[local_n][physical_k]
+                );
             }
             #pragma unroll
             for (int i = 0 ; i < Tr ; i++) {
@@ -727,18 +765,22 @@ __global__ void flash_attention_fp32_kernel(
             const int load_K_smem_Bc = tid / (NUM_THREADS / Bc);
             const int load_K_smem_d = (tid % (NUM_THREADS / Bc)) * (HEAD_DIM / (NUM_THREADS / Bc));
             const int load_K_gmem_Bc = (tile_N_id + 1) * Bc + load_K_smem_Bc;
-            const int load_K_gmem_d = load_K_smem_d;
             #pragma unroll
             for (int i = 0 ; i < (HEAD_DIM / (NUM_THREADS / Bc)); i += 4) {
-                uint32_t load_K_smem_ptr = smem_K_base_ptr + (load_K_smem_Bc * HEAD_DIM + load_K_smem_d + i) * sizeof(float);
+                const int logical_d = load_K_smem_d + i;
+                const int k_group = load_K_smem_Bc / Tc;
+                const int physical_d =
+                    swizzle_fp32_float4_d<HEAD_DIM>(logical_d, k_group);
+                uint32_t load_K_smem_ptr = smem_K_base_ptr +
+                    (load_K_smem_Bc * HEAD_DIM + physical_d) * sizeof(float);
                 if (load_K_gmem_Bc < src_seq_len) {
                     const int load_K_gmem_offset =
                         batch_id * src_seq_len * kv_heads * HEAD_DIM +
                         load_K_gmem_Bc * kv_heads * HEAD_DIM +
-                        head_kv_id * HEAD_DIM + load_K_gmem_d + i;
+                        head_kv_id * HEAD_DIM + logical_d;
                     CP_ASYNC_CG(load_K_smem_ptr, &K[load_K_gmem_offset], 16);
                 } else {
-                    LDST128BITS(smem_K[load_K_smem_Bc][load_K_smem_d + i]) =
+                    LDST128BITS(smem_K[load_K_smem_Bc][physical_d]) =
                         make_float4(0.f, 0.f, 0.f, 0.f);
                 }
             }
@@ -772,9 +814,11 @@ __global__ void flash_attention_fp32_kernel(
             if (tile_key_end > tile_query_begin) {
                 #pragma unroll
                 for (int i = 0 ; i < Tr ; ++i) {
+                    const int local_m =
+                        warp_m_id * Wr + lane_m_id +
+                        i * NUM_THREADS_PER_WARP_M;
                     const int query_idx =
-                        tile_query_begin + warp_m_id * Wr +
-                        lane_m_id * Tr + i;
+                        tile_query_begin + local_m;
                     #pragma unroll
                     for (int j = 0 ; j < Tc ; ++j) {
                         const int key_idx =
@@ -906,7 +950,9 @@ __global__ void flash_attention_fp32_kernel(
     {
         #pragma unroll
         for (int i = 0 ; i < Tr ; ++i) {
-            int local_m = warp_m_id * Wr + lane_m_id * Tr + i;
+            int local_m =
+                warp_m_id * Wr + lane_m_id +
+                i * NUM_THREADS_PER_WARP_M;
             int gmem_O_row = tile_Br_id * Br + local_m;
             if (gmem_O_row < target_seq_len) {
                 int gmem_O_base = batch_id * target_seq_len * query_heads * HEAD_DIM +
