@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 #include "../tester/utils.h"
 #include "./utils.h"
@@ -10,6 +11,44 @@ union alignas(16) PackHalf8 {
 };
 
 static constexpr size_t WARP_SIZE = 32;
+
+// One warp handles one short row. Keeping all lanes active makes the shuffle
+// reduction valid even when the row contains fewer than 32 elements.
+template<typename T, size_t hidden_size>
+__global__ void rms_norm_small_kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ weight,
+    T* __restrict__ output,
+    float eps
+) {
+    const size_t col = threadIdx.x;
+    const size_t offset = blockIdx.x * hidden_size + col;
+    float value = 0.0f;
+    if (col < hidden_size) {
+        if constexpr (std::is_same_v<T, float>) {
+            value = input[offset];
+        } else {
+            value = __half2float(input[offset]);
+        }
+    }
+
+    float sum = value * value;
+    #pragma unroll
+    for (int delta = 16; delta > 0; delta >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, delta);
+    }
+    const float inv_rms = __shfl_sync(
+        0xffffffff, rsqrtf(sum / static_cast<float>(hidden_size) + eps), 0);
+
+    if (col < hidden_size) {
+        if constexpr (std::is_same_v<T, float>) {
+            output[offset] = value * inv_rms * weight[col];
+        } else {
+            output[offset] = __float2half_rn(
+                value * inv_rms * __half2float(weight[col]));
+        }
+    }
+}
 
 template<size_t threads_per_block>
 __device__ __forceinline__ float rms_inv_reduce(

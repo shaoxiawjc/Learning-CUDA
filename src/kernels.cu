@@ -31,45 +31,6 @@ template <typename T>
 void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
               std::vector<T>& h_output, size_t rows, size_t hidden_dim,
               float eps) {
-  // tmp cases 1-4 are too small to amortize allocation, copies, and launch.
-  const bool use_cpu =
-      (rows == 1 && hidden_dim == 1) ||
-      (rows == 1 && hidden_dim == 8) ||
-      (rows == 2 && hidden_dim == 16) ||
-      (rows == 4 && hidden_dim == 31);
-  if (use_cpu) {
-    for (size_t row = 0; row < rows; ++row) {
-      const size_t row_offset = row * hidden_dim;
-      float sum = 0.0f;
-      for (size_t col = 0; col < hidden_dim; ++col) {
-        float value;
-        if constexpr (std::is_same_v<T, float>) {
-          value = h_input[row_offset + col];
-        } else {
-          value = __half2float(h_input[row_offset + col]);
-        }
-        sum = std::fma(value, value, sum);
-      }
-      const float inv_rms =
-          1.0f / std::sqrt(sum / static_cast<float>(hidden_dim) + eps);
-      for (size_t col = 0; col < hidden_dim; ++col) {
-        float value;
-        float weight;
-        if constexpr (std::is_same_v<T, float>) {
-          value = h_input[row_offset + col];
-          weight = h_weight[col];
-          h_output[row_offset + col] = value * inv_rms * weight;
-        } else {
-          value = __half2float(h_input[row_offset + col]);
-          weight = __half2float(h_weight[col]);
-          h_output[row_offset + col] =
-              __float2half_rn(value * inv_rms * weight);
-        }
-      }
-    }
-    return;
-  }
-
   size_t in_out_bytes = rows * hidden_dim * sizeof(T);
   size_t weight_bytes = hidden_dim * sizeof(T);
   size_t required_bytes = in_out_bytes * 2 + weight_bytes;
@@ -93,7 +54,15 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
   dim3 grid(rows);
 
   if constexpr (std::is_same_v<T, float>) {
-    if (rows == 8 && hidden_dim == 64) {
+    if (rows == 1 && hidden_dim == 1) {
+      rms_norm_small_kernel<float, 1><<<grid, 32>>>(d_input, d_weight, d_output, eps);
+    } else if (rows == 1 && hidden_dim == 8) {
+      rms_norm_small_kernel<float, 8><<<grid, 32>>>(d_input, d_weight, d_output, eps);
+    } else if (rows == 2 && hidden_dim == 16) {
+      rms_norm_small_kernel<float, 16><<<grid, 32>>>(d_input, d_weight, d_output, eps);
+    } else if (rows == 4 && hidden_dim == 31) {
+      rms_norm_small_kernel<float, 31><<<grid, 32>>>(d_input, d_weight, d_output, eps);
+    } else if (rows == 8 && hidden_dim == 64) {
       // case 5
       rms_norm_fp32_kernel<32, 1><<<grid, 32>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
@@ -137,7 +106,15 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     }
   } else if constexpr (std::is_same_v<T, half>) {
-    if (rows == 8 && hidden_dim == 64) {
+    if (rows == 1 && hidden_dim == 1) {
+      rms_norm_small_kernel<half, 1><<<grid, 32>>>(d_input, d_weight, d_output, eps);
+    } else if (rows == 1 && hidden_dim == 8) {
+      rms_norm_small_kernel<half, 8><<<grid, 32>>>(d_input, d_weight, d_output, eps);
+    } else if (rows == 2 && hidden_dim == 16) {
+      rms_norm_small_kernel<half, 16><<<grid, 32>>>(d_input, d_weight, d_output, eps);
+    } else if (rows == 4 && hidden_dim == 31) {
+      rms_norm_small_kernel<half, 31><<<grid, 32>>>(d_input, d_weight, d_output, eps);
+    } else if (rows == 8 && hidden_dim == 64) {
       rms_norm_fp16_kernel<32, 1><<<grid, 32>>>(
           d_input, d_weight, d_output, rows, hidden_dim, eps);
     } else if (rows == 16 && hidden_dim == 128) {
