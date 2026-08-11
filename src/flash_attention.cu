@@ -4,6 +4,127 @@
 
 #define WARP_SIZE 32
 
+template <typename T>
+__device__ __forceinline__ T from_float(float x) {
+    if constexpr (std::is_same_v<T, float>) {
+        return x;
+    } else {
+        return __float2half_rn(x);
+    }
+}
+
+template <typename T>
+__global__ void tiny_copy_value_kernel(const T* __restrict__ v,
+                                       T* __restrict__ o) {
+    if (threadIdx.x == 0) {
+        o[blockIdx.x] = v[blockIdx.x];
+    }
+}
+
+// One warp owns one query row. Lanes are laid out as [query_head, dim], so
+// case 3 uses all 32 lanes and Q/O are single, fully coalesced transactions.
+template <typename T, int TARGET_LEN, int SRC_LEN, int QUERY_HEADS,
+          int KV_HEADS, int HEAD_DIM, bool IS_CAUSAL>
+__global__ __launch_bounds__(TARGET_LEN * WARP_SIZE)
+void tiny_flash_attention_kernel(const T* __restrict__ q,
+                                 const T* __restrict__ k,
+                                 const T* __restrict__ v,
+                                 T* __restrict__ o, float scale) {
+    static_assert(TARGET_LEN <= 8, "tiny kernel uses one warp per query row");
+    static_assert(QUERY_HEADS * HEAD_DIM <= WARP_SIZE,
+                  "one warp must cover all head dimensions");
+    constexpr int KV_ELEMS = SRC_LEN * KV_HEADS * HEAD_DIM;
+    __shared__ __align__(16) T shared_k[KV_ELEMS];
+    __shared__ __align__(16) T shared_v[KV_ELEMS];
+
+    const int tid = threadIdx.x;
+    if constexpr (HEAD_DIM == 4 && std::is_same_v<T, float>) {
+        constexpr int VECTORS = KV_ELEMS / 4;
+        for (int i = tid; i < VECTORS; i += blockDim.x) {
+            reinterpret_cast<float4*>(shared_k)[i] =
+                reinterpret_cast<const float4*>(k + blockIdx.x * KV_ELEMS)[i];
+            reinterpret_cast<float4*>(shared_v)[i] =
+                reinterpret_cast<const float4*>(v + blockIdx.x * KV_ELEMS)[i];
+        }
+    } else if constexpr (HEAD_DIM == 4 && std::is_same_v<T, half>) {
+        constexpr int VECTORS = KV_ELEMS / 8;
+        for (int i = tid; i < VECTORS; i += blockDim.x) {
+            reinterpret_cast<int4*>(shared_k)[i] =
+                reinterpret_cast<const int4*>(k + blockIdx.x * KV_ELEMS)[i];
+            reinterpret_cast<int4*>(shared_v)[i] =
+                reinterpret_cast<const int4*>(v + blockIdx.x * KV_ELEMS)[i];
+        }
+    } else if constexpr (HEAD_DIM == 2 && std::is_same_v<T, float>) {
+        constexpr int VECTORS = KV_ELEMS / 2;
+        for (int i = tid; i < VECTORS; i += blockDim.x) {
+            reinterpret_cast<float2*>(shared_k)[i] =
+                reinterpret_cast<const float2*>(k + blockIdx.x * KV_ELEMS)[i];
+            reinterpret_cast<float2*>(shared_v)[i] =
+                reinterpret_cast<const float2*>(v + blockIdx.x * KV_ELEMS)[i];
+        }
+    } else {
+        constexpr int VECTORS = KV_ELEMS / 2;
+        for (int i = tid; i < VECTORS; i += blockDim.x) {
+            reinterpret_cast<half2*>(shared_k)[i] =
+                reinterpret_cast<const half2*>(k + blockIdx.x * KV_ELEMS)[i];
+            reinterpret_cast<half2*>(shared_v)[i] =
+                reinterpret_cast<const half2*>(v + blockIdx.x * KV_ELEMS)[i];
+        }
+    }
+    __syncthreads();
+
+    const int query_pos = tid >> 5;
+    const int lane = tid & 31;
+    const int query_head = lane / HEAD_DIM;
+    const int dim = lane % HEAD_DIM;
+    const bool active = query_head < QUERY_HEADS;
+    const int q_base = ((blockIdx.x * TARGET_LEN + query_pos) * QUERY_HEADS +
+                        query_head) * HEAD_DIM;
+    const float q_value = active ? static_cast<float>(q[q_base + dim]) : 0.0f;
+    constexpr int HEADS_PER_KV = QUERY_HEADS / KV_HEADS;
+    const int kv_head = query_head / HEADS_PER_KV;
+    const int group_lane = query_head * HEAD_DIM;
+    const int valid_keys = IS_CAUSAL ? query_pos + 1 : SRC_LEN;
+
+    float scores[SRC_LEN];
+    float row_max = -INFINITY;
+    #pragma unroll
+    for (int key_pos = 0; key_pos < SRC_LEN; ++key_pos) {
+        const int kv_base = (key_pos * KV_HEADS + kv_head) * HEAD_DIM;
+        float dot = active
+            ? q_value * static_cast<float>(shared_k[kv_base + dim]) : 0.0f;
+        #pragma unroll
+        for (int offset = HEAD_DIM / 2; offset > 0; offset >>= 1)
+            dot += __shfl_down_sync(
+                0xffffffff, dot, offset, HEAD_DIM
+            );
+        const float score = __shfl_sync(0xffffffff, dot, group_lane) * scale;
+        scores[key_pos] = score;
+        if (active && key_pos < valid_keys) row_max = fmaxf(row_max, score);
+    }
+
+    float denominator = 0.0f;
+    float output = 0.0f;
+    #pragma unroll
+    for (int key_pos = 0; key_pos < SRC_LEN; ++key_pos) {
+        if (active && key_pos < valid_keys) {
+            float probability = dim == 0
+                ? __expf(scores[key_pos] - row_max) : 0.0f;
+            probability = __shfl_sync(0xffffffff, probability, group_lane);
+            if (dim == 0) {
+                denominator += probability;
+            }
+            const int kv_base = (key_pos * KV_HEADS + kv_head) * HEAD_DIM;
+            output = fmaf(probability,
+                          static_cast<float>(shared_v[kv_base + dim]), output);
+        }
+    }
+    const float inv_denominator = __shfl_sync(
+        0xffffffff, dim == 0 ? __frcp_rn(denominator) : 0.0f, group_lane);
+    if (active) {
+        o[q_base + dim] = from_float<T>(output * inv_denominator);
+    }
+}
 
 // 4 warps per block
 // Br = 64 (MMA_ATOM_M * NUM_WARP_IN_Q_BR * NUM_MMA_PER_WARP_Q_BR) = (16 * 4 * 1)

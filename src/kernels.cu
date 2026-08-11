@@ -7,7 +7,6 @@
 #include "./utils.h"
 #include "./rms_norm.cu"
 #include "./flash_attention.cu"
-#include "./tiny_fa.cu"
 
 /**
  * @brief Computes RMSNorm over the last dimension of a 2D tensor.
@@ -179,32 +178,6 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   //   "b=%d, tgt_len=%d, src_len=%d, qh=%d, kvh=%d, d=%d, is_causal=%d\n",
   //   batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim, is_causal?1:0
   // );
-  // case1
-  if (head_dim == 1) {
-    h_o[0] = h_v[0];
-    return;
-  }
-
-  //case 2
-  if (head_dim == 2) {
-    if constexpr (std::is_same_v<T, half>) {
-      case2_kernel_fp16_cpu(h_q.data(), h_k.data(), h_v.data(), h_o.data());
-    } else {
-      case2_kernel_fp32_cpu(h_q.data(), h_k.data(), h_v.data(), h_o.data());
-    }
-    return;
-  }
-
-  // case4
-  if (head_dim == 4) {
-    if constexpr (std::is_same_v<T, half>) {
-      case3_small_attention_fp16_cpu(h_q.data(), h_k.data(), h_v.data(), h_o.data());
-    } else {
-      case3_small_attention_fp32_cpu(h_q.data(), h_k.data(), h_v.data(), h_o.data());
-    }
-    return;
-  }
-
   if constexpr (std::is_same_v<T, float>) {
     const int input_src_seq_len = src_seq_len;
     const int src_seq_len = is_causal && target_seq_len < input_src_seq_len
@@ -257,6 +230,17 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
     switch (head_dim) {
+      case 1:
+        tiny_copy_value_kernel<float><<<batch_size, 32>>>(d_v, d_o);
+        break;
+      case 2:
+        tiny_flash_attention_kernel<float, 3, 3, 3, 1, 2, true>
+            <<<batch_size, 96>>>(d_q, d_k, d_v, d_o, scale);
+        break;
+      case 4:
+        tiny_flash_attention_kernel<float, 8, 8, 8, 4, 4, false>
+            <<<batch_size, 256>>>(d_q, d_k, d_v, d_o, scale);
+        break;
       case 8: {
         if (target_seq_len <= 16 && src_seq_len <= 16) {
           // case4/case7/case8/case9: pad to one 16x16 score tile.
@@ -421,6 +405,17 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     dim3 grid(batch_size * query_heads, div_ceil(target_seq_len, Br));
 
     switch (head_dim) {
+      case 1:
+        tiny_copy_value_kernel<half><<<batch_size, 32>>>(d_v, d_o);
+        break;
+      case 2:
+        tiny_flash_attention_kernel<half, 3, 3, 3, 1, 2, true>
+            <<<batch_size, 96>>>(d_q, d_k, d_v, d_o, scale);
+        break;
+      case 4:
+        tiny_flash_attention_kernel<half, 8, 8, 8, 4, 4, false>
+            <<<batch_size, 256>>>(d_q, d_k, d_v, d_o, scale);
+        break;
       case 8: {
         constexpr int NUM_MMA_PER_WARP_V_HEAD_DIM = 1;
         if (target_seq_len <= 16 && src_seq_len <= 16) {
