@@ -4,8 +4,7 @@
 #include <musa_runtime.h>
 #include <type_traits>
 
-static const int FLASH_WARP_SIZE = 32;
-static const unsigned FLASH_FULL_MASK = 0xffffffffu;
+#define WARP_SIZE 32
 
 template <typename T>
 struct FlashConvert;
@@ -50,8 +49,8 @@ struct FlashConvert<half> {
 __device__ __forceinline__ float flash_warp_sum(float value) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1)
-    value += __shfl_down_sync(FLASH_FULL_MASK, value, offset);
-  return __shfl_sync(FLASH_FULL_MASK, value, 0);
+    value += __shfl_down_sync(0xffffffff, value, offset);
+  return __shfl_sync(0xffffffff, value, 0);
 }
 
 
@@ -64,8 +63,8 @@ __global__ void flash_attention_warp_kernel(
     const T* __restrict__ value, T* __restrict__ output,
     int target_seq_len, int src_seq_len, int query_heads, int kv_heads,
     float scale) {
-  const int lane = threadIdx.x & (FLASH_WARP_SIZE - 1);
-  const int warp = threadIdx.x / FLASH_WARP_SIZE;
+  const int lane = threadIdx.x & (WARP_SIZE - 1);
+  const int warp = threadIdx.x / WARP_SIZE;
   const int work = blockIdx.x * WARPS_PER_BLOCK + warp;
   const int query_head = work % query_heads;
   const int token_and_batch = work / query_heads;
@@ -101,9 +100,9 @@ __global__ void flash_attention_warp_kernel(
     if (lane < HEAD_DIM)
       dot += FlashConvert<T>::load(q + lane) *
              FlashConvert<T>::load(k + lane);
-    if (lane + FLASH_WARP_SIZE < HEAD_DIM)
-      dot += FlashConvert<T>::load(q + lane + FLASH_WARP_SIZE) *
-             FlashConvert<T>::load(k + lane + FLASH_WARP_SIZE);
+    if (lane + WARP_SIZE < HEAD_DIM)
+      dot += FlashConvert<T>::load(q + lane + WARP_SIZE) *
+             FlashConvert<T>::load(k + lane + WARP_SIZE);
     dot = flash_warp_sum(dot) * scale;
 
     const float next_maximum = fmaxf(maximum, dot);
@@ -113,19 +112,19 @@ __global__ void flash_attention_warp_kernel(
     if (lane < HEAD_DIM)
       out0 = out0 * old_scale +
              probability * FlashConvert<T>::load(v + lane);
-    if (lane + FLASH_WARP_SIZE < HEAD_DIM)
+    if (lane + WARP_SIZE < HEAD_DIM)
       out1 = out1 * old_scale +
              probability *
-                 FlashConvert<T>::load(v + lane + FLASH_WARP_SIZE);
+                 FlashConvert<T>::load(v + lane + WARP_SIZE);
     maximum = next_maximum;
   }
 
   const float inverse_denominator = 1.0f / denominator;
   if (lane < HEAD_DIM)
     FlashConvert<T>::store(o + lane, out0 * inverse_denominator);
-  if (lane + FLASH_WARP_SIZE < HEAD_DIM)
+  if (lane + WARP_SIZE < HEAD_DIM)
     FlashConvert<T>::store(
-        o + lane + FLASH_WARP_SIZE, out1 * inverse_denominator);
+        o + lane + WARP_SIZE, out1 * inverse_denominator);
 }
 
 template <typename T, bool IS_CAUSAL>
@@ -159,7 +158,7 @@ __global__ void flash_attention_generic_warp_kernel(
         kv_batch_offset +
         (static_cast<size_t>(key_token) * kv_heads + kv_head) * head_dim;
     float dot = 0.0f;
-    for (int d = lane; d < head_dim; d += FLASH_WARP_SIZE)
+    for (int d = lane; d < head_dim; d += WARP_SIZE)
       dot += FlashConvert<T>::load(q + d) *
              FlashConvert<T>::load(key + kv_offset + d);
     dot = flash_warp_sum(dot) * scale;
@@ -168,14 +167,14 @@ __global__ void flash_attention_generic_warp_kernel(
     const float probability = FlashExp<T>::eval(dot - next_maximum);
     denominator = denominator * old_scale + probability;
     for (int d = lane, item = 0; d < head_dim;
-         d += FLASH_WARP_SIZE, ++item)
+         d += WARP_SIZE, ++item)
       accumulators[item] =
           accumulators[item] * old_scale +
           probability * FlashConvert<T>::load(value + kv_offset + d);
     maximum = next_maximum;
   }
   for (int d = lane, item = 0; d < head_dim;
-       d += FLASH_WARP_SIZE, ++item)
+       d += WARP_SIZE, ++item)
     FlashConvert<T>::store(o + d, accumulators[item] / denominator);
 }
 
@@ -217,15 +216,18 @@ struct MusaFlashLauncher {
 #undef FLASH_LAUNCH
   }
 };
-template <int HEAD_DIM>
-__device__ __forceinline__ int musa_swizzle_fp32_shared_d(
-    int logical_d, int row)
-{
+
+
+template<const int HEAD_DIM>
+__device__ __forceinline__ int swizzle_fp32_float4_d(
+    const int logical_d,
+    const int group_id
+) {
     if constexpr (HEAD_DIM == 32 || HEAD_DIM == 64) {
-        constexpr int NUM_CHUNKS = HEAD_DIM / 4;
+        constexpr int NUM_FLOAT4_CHUNKS = HEAD_DIM / 4;
         const int logical_chunk = logical_d / 4;
         const int physical_chunk =
-            logical_chunk ^ (row & (NUM_CHUNKS - 1));
+            logical_chunk ^ (group_id & (NUM_FLOAT4_CHUNKS - 1));
         return physical_chunk * 4 + logical_d % 4;
     } else {
         return logical_d;
@@ -242,18 +244,17 @@ template<
     const int HEAD_DIM,
     const int NUM_THREADS,
     bool IS_CAUSAL
->
-__device__ __forceinline__ void musa_flash_attention_fp32_tiled_body(
+    >
+__device__ __forceinline__ void flash_attention_fp32_body(
     const float* Q,
     const float* K,
     const float* V,
     float* O,
     const float scale,
     int batch_size, int target_seq_len, int src_seq_len,
-    int query_heads, int kv_heads, unsigned char* smem_storage)
-{
-    constexpr int WARP_SIZE = 32;
-    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    int query_heads, int kv_heads,
+    unsigned char* smem_storage
+) {
     constexpr int THREADS_PER_WARP_M = Wr / Tr;
     constexpr int THREADS_PER_WARP_N = Wc / Tc;
     constexpr int OUTPUT_TILES = (HEAD_DIM + Wc - 1) / Wc;
@@ -290,7 +291,7 @@ __device__ __forceinline__ void musa_flash_attention_fp32_tiled_body(
             const int d = (vec_id - row * VECS_PER_ROW) * 4;
             const int query_id = tile_Br_begin + row;
             const int physical_d =
-                musa_swizzle_fp32_shared_d<HEAD_DIM>(
+                swizzle_fp32_float4_d<HEAD_DIM>(
                     d, row % THREADS_PER_WARP_M);
             float4* smem_ptr = reinterpret_cast<float4*>(
                 &smem_Q[row][physical_d]);
@@ -351,7 +352,7 @@ __device__ __forceinline__ void musa_flash_attention_fp32_tiled_body(
                 const int d = (vec_id - key * VECS_PER_ROW) * 4;
                 const int key_id = tile_N_id * Bc + key;
                 const int physical_d =
-                    musa_swizzle_fp32_shared_d<HEAD_DIM>(d, key / Tc);
+                    swizzle_fp32_float4_d<HEAD_DIM>(d, key / Tc);
                 float4* smem_K_ptr = reinterpret_cast<float4*>(
                     &smem_K[key][physical_d]);
                 float4* smem_V_ptr = reinterpret_cast<float4*>(
@@ -408,7 +409,7 @@ __device__ __forceinline__ void musa_flash_attention_fp32_tiled_body(
                         warp_id * Wr + lane_m_id +
                         i * THREADS_PER_WARP_M;
                     const int physical_d =
-                        musa_swizzle_fp32_shared_d<HEAD_DIM>(
+                        swizzle_fp32_float4_d<HEAD_DIM>(
                             d, local_m % THREADS_PER_WARP_M);
                     reg_Q[i] = *reinterpret_cast<const float4*>(
                         &smem_Q[local_m][physical_d]);
@@ -417,7 +418,7 @@ __device__ __forceinline__ void musa_flash_attention_fp32_tiled_body(
                 for (int j = 0; j < Tc; ++j) {
                     const int local_n = lane_n_id * Tc + j;
                     const int physical_d =
-                        musa_swizzle_fp32_shared_d<HEAD_DIM>(d, local_n / Tc);
+                        swizzle_fp32_float4_d<HEAD_DIM>(d, local_n / Tc);
                     reg_K[j] = *reinterpret_cast<const float4*>(
                         &smem_K[local_n][physical_d]);
                 }
@@ -447,7 +448,7 @@ __device__ __forceinline__ void musa_flash_attention_fp32_tiled_body(
                         warp_id * Wr + lane_m_id +
                         i * THREADS_PER_WARP_M;
                     const int physical_d =
-                        musa_swizzle_fp32_shared_d<HEAD_DIM>(
+                        swizzle_fp32_float4_d<HEAD_DIM>(
                             d, local_m % THREADS_PER_WARP_M);
                     reg_Q[i] = smem_Q[local_m][physical_d];
                 }
@@ -455,7 +456,7 @@ __device__ __forceinline__ void musa_flash_attention_fp32_tiled_body(
                 for (int j = 0; j < Tc; ++j) {
                     const int local_n = lane_n_id * Tc + j;
                     const int physical_d =
-                        musa_swizzle_fp32_shared_d<HEAD_DIM>(d, local_n / Tc);
+                        swizzle_fp32_float4_d<HEAD_DIM>(d, local_n / Tc);
                     reg_K[j] = smem_K[local_n][physical_d];
                 }
                 #pragma unroll
@@ -493,7 +494,7 @@ __device__ __forceinline__ void musa_flash_attention_fp32_tiled_body(
             for (int offset = THREADS_PER_WARP_N / 2;
                  offset > 0; offset >>= 1) {
                 maximum = fmaxf(maximum, __shfl_xor_sync(
-                    FLASH_FULL_MASK, maximum, offset, THREADS_PER_WARP_N));
+                    0xffffffff, maximum, offset, THREADS_PER_WARP_N));
             }
             block_row_max_new[i] =
                 fmaxf(block_row_max_old[i], maximum);
@@ -515,7 +516,7 @@ __device__ __forceinline__ void musa_flash_attention_fp32_tiled_body(
             for (int offset = THREADS_PER_WARP_N / 2;
                  offset > 0; offset >>= 1) {
                 sum += __shfl_xor_sync(
-                    FLASH_FULL_MASK, sum, offset, THREADS_PER_WARP_N);
+                    0xffffffff, sum, offset, THREADS_PER_WARP_N);
             }
             block_row_sum_new[i] = sum;
         }
@@ -543,7 +544,7 @@ __device__ __forceinline__ void musa_flash_attention_fp32_tiled_body(
                 #pragma unroll
                 for (int i = 0; i < Tr; ++i) {
                     const float probability = __shfl_sync(
-                        FLASH_FULL_MASK, reg_P[i][owner_reg], owner_lane,
+                        0xffffffff, reg_P[i][owner_reg], owner_lane,
                         WARP_SIZE);
                     #pragma unroll
                     for (int out_tile = 0;
@@ -615,31 +616,55 @@ __device__ __forceinline__ void musa_flash_attention_fp32_tiled_body(
 }
 
 template<
-    const int Br, const int Bc, const int Wr, const int Wc,
-    const int Tr, const int Tc, const int HEAD_DIM,
-    const int NUM_THREADS, bool IS_CAUSAL>
-__global__ void musa_flash_attention_fp32_tiled_kernel(
-    const float* Q, const float* K, const float* V, float* O,
-    const float scale, int batch_size, int target_seq_len, int src_seq_len,
-    int query_heads, int kv_heads) {
+    const int Br,
+    const int Bc,
+    const int Wr,
+    const int Wc,
+    const int Tr,
+    const int Tc,
+    const int HEAD_DIM,
+    const int NUM_THREADS,
+    bool IS_CAUSAL
+    >
+__global__ void flash_attention_fp32_kernel(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    const float scale,
+    int batch_size, int target_seq_len, int src_seq_len,
+    int query_heads, int kv_heads
+) {
     extern __shared__ __align__(16) unsigned char smem_storage[];
-    musa_flash_attention_fp32_tiled_body<
+    flash_attention_fp32_body<
         Br, Bc, Wr, Wc, Tr, Tc, HEAD_DIM, NUM_THREADS, IS_CAUSAL>(
             Q, K, V, O, scale, batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads, smem_storage);
 }
 
 template<
-    const int Br, const int Bc, const int Wr, const int Wc,
-    const int Tr, const int Tc, const int HEAD_DIM,
-    const int NUM_THREADS, bool IS_CAUSAL>
-__global__ void musa_flash_attention_fp32_tiled_static_kernel(
-    const float* Q, const float* K, const float* V, float* O,
-    const float scale, int batch_size, int target_seq_len, int src_seq_len,
-    int query_heads, int kv_heads) {
+    const int Br,
+    const int Bc,
+    const int Wr,
+    const int Wc,
+    const int Tr,
+    const int Tc,
+    const int HEAD_DIM,
+    const int NUM_THREADS,
+    bool IS_CAUSAL
+    >
+__global__ void flash_attention_fp32_static_kernel(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    const float scale,
+    int batch_size, int target_seq_len, int src_seq_len,
+    int query_heads, int kv_heads
+) {
     __shared__ __align__(16)
         unsigned char smem_storage[(Br + 2 * Bc) * HEAD_DIM * sizeof(float)];
-    musa_flash_attention_fp32_tiled_body<
+    flash_attention_fp32_body<
         Br, Bc, Wr, Wc, Tr, Tc, HEAD_DIM, NUM_THREADS, IS_CAUSAL>(
             Q, K, V, O, scale, batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads, smem_storage);
@@ -647,7 +672,7 @@ __global__ void musa_flash_attention_fp32_tiled_static_kernel(
 
 
 template <typename T>
-__device__ __forceinline__ T musa_flash_from_float(float x) {
+__device__ __forceinline__ T from_float(float x) {
     if constexpr (std::is_same<T, float>::value) {
         return x;
     } else {
@@ -656,7 +681,7 @@ __device__ __forceinline__ T musa_flash_from_float(float x) {
 }
 
 template <typename T>
-__global__ void musa_tiny_copy_value_kernel(const T* __restrict__ v,
+__global__ void tiny_copy_value_kernel(const T* __restrict__ v,
                                        T* __restrict__ o) {
     if (threadIdx.x == 0) {
         o[blockIdx.x] = v[blockIdx.x];
@@ -667,13 +692,13 @@ __global__ void musa_tiny_copy_value_kernel(const T* __restrict__ v,
 // case 3 uses all 32 lanes and Q/O are single, fully coalesced transactions.
 template <typename T, int TARGET_LEN, int SRC_LEN, int QUERY_HEADS,
           int KV_HEADS, int HEAD_DIM, bool IS_CAUSAL>
-__global__ __launch_bounds__(TARGET_LEN * FLASH_WARP_SIZE)
-void musa_tiny_flash_attention_kernel(const T* __restrict__ q,
+__global__ __launch_bounds__(TARGET_LEN * WARP_SIZE)
+void tiny_flash_attention_kernel(const T* __restrict__ q,
                                  const T* __restrict__ k,
                                  const T* __restrict__ v,
                                  T* __restrict__ o, float scale) {
     static_assert(TARGET_LEN <= 8, "tiny kernel uses one warp per query row");
-    static_assert(QUERY_HEADS * HEAD_DIM <= FLASH_WARP_SIZE,
+    static_assert(QUERY_HEADS * HEAD_DIM <= WARP_SIZE,
                   "one warp must cover all head dimensions");
     constexpr int KV_ELEMS = SRC_LEN * KV_HEADS * HEAD_DIM;
     __shared__ __align__(16) T shared_k[KV_ELEMS];
@@ -776,9 +801,11 @@ void musa_tiny_flash_attention_kernel(const T* __restrict__ q,
     const float inv_denominator = __shfl_sync(
         0xffffffff, dim == 0 ? __frcp_rn(denominator) : 0.0f, group_lane);
     if (active) {
-        o[q_base + dim] = musa_flash_from_float<T>(output * inv_denominator);
+        o[q_base + dim] = from_float<T>(output * inv_denominator);
     }
 }
+
+
 template <>
 struct MusaFlashLauncher<float> {
   static void launch(const float* q, const float* k, const float* v, float* o,
@@ -788,17 +815,17 @@ struct MusaFlashLauncher<float> {
     const float scale = rsqrtf(static_cast<float>(head_dim));
 
     if (head_dim == 1) {
-      musa_tiny_copy_value_kernel<float><<<batch_size, 32>>>(v, o);
+      tiny_copy_value_kernel<float><<<batch_size, 32>>>(v, o);
       return;
     }
     if (head_dim == 2) {
-      musa_tiny_flash_attention_kernel<
+      tiny_flash_attention_kernel<
           float, 3, 3, 3, 1, 2, true><<<batch_size, 96>>>(
           q, k, v, o, scale);
       return;
     }
     if (head_dim == 4) {
-      musa_tiny_flash_attention_kernel<
+      tiny_flash_attention_kernel<
           float, 8, 8, 8, 4, 4, false><<<batch_size, 256>>>(
           q, k, v, o, scale);
       return;
@@ -807,12 +834,12 @@ struct MusaFlashLauncher<float> {
     if (head_dim == 8 && target_seq_len <= 16 && src_seq_len <= 16) {
       const dim3 grid(batch_size * query_heads, 1);
       if (is_causal)
-        musa_flash_attention_fp32_tiled_kernel<
+        flash_attention_fp32_kernel<
             16, 16, 16, 16, 4, 2, 8, 32, true><<<grid, 32, 1536>>>(
             q, k, v, o, scale, batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads);
       else
-        musa_flash_attention_fp32_tiled_kernel<
+        flash_attention_fp32_kernel<
             16, 16, 16, 16, 4, 2, 8, 32, false><<<grid, 32, 1536>>>(
             q, k, v, o, scale, batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads);
@@ -823,12 +850,12 @@ struct MusaFlashLauncher<float> {
       const dim3 grid(batch_size * query_heads,
                       (target_seq_len + 31) / 32);
       if (is_causal)
-        musa_flash_attention_fp32_tiled_kernel<
+        flash_attention_fp32_kernel<
             32, 32, 16, 32, 4, 4, 8, 64, true><<<grid, 64, 3072>>>(
             q, k, v, o, scale, batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads);
       else
-        musa_flash_attention_fp32_tiled_kernel<
+        flash_attention_fp32_kernel<
             32, 32, 16, 32, 4, 4, 8, 64, false><<<grid, 64, 3072>>>(
             q, k, v, o, scale, batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads);
@@ -838,14 +865,14 @@ struct MusaFlashLauncher<float> {
     if (head_dim == 16) {
       if (target_seq_len == 16 && is_causal) {
         const dim3 grid(batch_size * query_heads, 1);
-        musa_flash_attention_fp32_tiled_kernel<
+        flash_attention_fp32_kernel<
             16, 16, 16, 16, 4, 2, 16, 32, true><<<grid, 32, 3072>>>(
             q, k, v, o, scale, batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads);
       } else {
         const dim3 grid(batch_size * query_heads,
                         (target_seq_len + 31) / 32);
-        musa_flash_attention_fp32_tiled_kernel<
+        flash_attention_fp32_kernel<
             32, 16, 16, 16, 4, 2, 16, 64, false><<<grid, 64, 4096>>>(
             q, k, v, o, scale, batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads);
@@ -857,12 +884,12 @@ struct MusaFlashLauncher<float> {
       const dim3 grid(batch_size * query_heads,
                       (target_seq_len + 63) / 64);
       if (is_causal)
-        musa_flash_attention_fp32_tiled_kernel<
+        flash_attention_fp32_kernel<
             64, 32, 16, 32, 4, 4, 32, 128, true><<<grid, 128, 16384>>>(
             q, k, v, o, scale, batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads);
       else
-        musa_flash_attention_fp32_tiled_kernel<
+        flash_attention_fp32_kernel<
             64, 32, 16, 32, 4, 4, 32, 128, false><<<grid, 128, 16384>>>(
             q, k, v, o, scale, batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads);
@@ -874,12 +901,12 @@ struct MusaFlashLauncher<float> {
       const dim3 grid(batch_size * query_heads,
                       (target_seq_len + 31) / 32);
       if (is_causal)
-        musa_flash_attention_fp32_tiled_static_kernel<
+        flash_attention_fp32_static_kernel<
             32, 32, 8, 32, 2, 4, 64, 128, true><<<grid, 128>>>(
             q, k, v, o, scale, batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads);
       else
-        musa_flash_attention_fp32_tiled_static_kernel<
+        flash_attention_fp32_static_kernel<
             32, 32, 8, 32, 2, 4, 64, 128, false><<<grid, 128>>>(
             q, k, v, o, scale, batch_size, target_seq_len, src_seq_len,
             query_heads, kv_heads);
@@ -905,17 +932,17 @@ struct MusaFlashLauncher<half> {
                      bool is_causal) {
     const float scale = rsqrtf(static_cast<float>(head_dim));
     if (head_dim == 1) {
-      musa_tiny_copy_value_kernel<half><<<batch_size, 32>>>(v, o);
+      tiny_copy_value_kernel<half><<<batch_size, 32>>>(v, o);
       return;
     }
     if (head_dim == 2) {
-      musa_tiny_flash_attention_kernel<
+      tiny_flash_attention_kernel<
           half, 3, 3, 3, 1, 2, true><<<batch_size, 96>>>(
           q, k, v, o, scale);
       return;
     }
     if (head_dim == 4) {
-      musa_tiny_flash_attention_kernel<
+      tiny_flash_attention_kernel<
           half, 8, 8, 8, 4, 4, false><<<batch_size, 256>>>(
           q, k, v, o, scale);
       return;
