@@ -16,6 +16,8 @@ PLATFORM_DEFINE ?= -DPLATFORM_NVIDIA
 STUDENT_SUFFIX  := cu
 CFLAGS          := -std=c++17 -O0
 EXTRA_LIBS     	:=
+MOORE_COMPAT_SRC :=
+MOORE_COMPAT_OBJ :=
 
 # Compiler & Tester object selection based on PLATFORM
 ifeq ($(PLATFORM),nvidia)
@@ -35,6 +37,8 @@ else ifeq ($(PLATFORM),moore)
 	TEST_OBJ    	:= tester/tester_moore.o
 	STUDENT_SUFFIX  := mu
 	PLATFORM_DEFINE := -DPLATFORM_MOORE
+	MOORE_COMPAT_SRC := src/musa_runtime_compat.cc
+	MOORE_COMPAT_OBJ := src/musa_runtime_compat.o
 	EXTRA_LIBS		:= -I/usr/local/musa/include -L/usr/lib/gcc/x86_64-linux-gnu/11/ -L/usr/local/musa/lib -lmusart
 else ifeq ($(PLATFORM),metax)
 	CC          	:= mxcc
@@ -51,6 +55,7 @@ TARGET          	:= test_kernels
 STUDENT_SRC     	:= src/kernels.$(STUDENT_SUFFIX)
 # Compiled student object (auto-generated)
 STUDENT_OBJ  		:= $(addsuffix .o,$(basename $(STUDENT_SRC)))
+KERNEL_DEPS      := $(wildcard src/*.mu)
 # Tester's actual verbose argument (e.g., --verbose, -v)
 TEST_VERBOSE_FLAG 	:= --verbose
 # User-provided verbose mode (true/false; default: false)
@@ -88,18 +93,24 @@ run: $(TARGET)
 # Clean target: Delete temporary files (executable + src object)
 clean:
 	@echo "=== Cleaning temporary files ==="
-	rm -f $(TARGET) $(STUDENT_OBJ)
+	rm -f $(TARGET) $(STUDENT_OBJ) $(MOORE_COMPAT_OBJ)
 
 # -------------------------------
 # Dependency Rules (Core Logic)
 # -------------------------------
 # Generate executable: Link kernel code (kernels.o) with test logic (tester.o)
-$(TARGET): $(STUDENT_OBJ) $(TEST_OBJ)
+$(TARGET): $(STUDENT_OBJ) $(TEST_OBJ) $(MOORE_COMPAT_OBJ)
 	@echo "=== Linking executable (student code + test logic) ==="
 	$(CC) $(CFLAGS) $(PLATFORM_DEFINE) -o $@ $^ $(EXTRA_LIBS)
 
 # Generate src object: Compile kernels.cu (triggers template instantiation)
-$(STUDENT_OBJ): $(STUDENT_SRC)
+$(STUDENT_OBJ): $(STUDENT_SRC) $(KERNEL_DEPS)
 	@echo "=== Compiling student code ($(STUDENT_SRC)) ==="
 	$(CC) $(CFLAGS) $(PLATFORM_DEFINE) -c $< -o $@
 
+
+ifneq ($(MOORE_COMPAT_OBJ),)
+$(MOORE_COMPAT_OBJ): $(MOORE_COMPAT_SRC)
+	@echo "=== Compiling MUSA runtime ABI compatibility shim ==="
+	$(CC) $(CFLAGS) $(PLATFORM_DEFINE) -I/usr/local/musa/include -c $< -o $@
+endif
