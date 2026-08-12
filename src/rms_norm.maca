@@ -1,0 +1,570 @@
+#include <common/maca_fp16.h>
+#include <cstdint>
+#include <type_traits>
+
+static constexpr size_t WARP_SIZE = 64;
+static constexpr uint64_t FULL_MASK = UINT64_MAX;
+
+union alignas(16) PackHalf8 {
+    float4 packed;
+    half2 data[4];
+};
+
+template<typename T, size_t hidden_size>
+__global__ void rms_norm_small_kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ weight,
+    T* __restrict__ output,
+    float eps
+) {
+    const size_t col = threadIdx.x;
+    const size_t offset = blockIdx.x * hidden_size + col;
+    float value = 0.0f;
+    if (col < hidden_size) {
+        if constexpr (std::is_same_v<T, float>) {
+            value = input[offset];
+        } else {
+            value = __half2float(input[offset]);
+        }
+    }
+
+    const float sum = __reduce_add_sync(FULL_MASK, value * value);
+    const float inv_rms = __shfl_sync(
+        FULL_MASK,
+        rsqrtf(sum / static_cast<float>(hidden_size) + eps),
+        0
+    );
+
+    if (col < hidden_size) {
+        if constexpr (std::is_same_v<T, float>) {
+            output[offset] = value * inv_rms * weight[col];
+        } else {
+            output[offset] = __float2half_rn(
+                value * inv_rms * __half2float(weight[col])
+            );
+        }
+    }
+}
+
+template<size_t threads_per_block>
+__device__ __forceinline__ float rms_inv_reduce(
+    float sum, size_t hidden_dim, float eps,
+    float* sdata, float* shared_rms_inv
+) {
+    static_assert(threads_per_block % WARP_SIZE == 0,
+                  "threads_per_block must be a multiple of MACA warp size");
+    constexpr size_t num_warps = threads_per_block / WARP_SIZE;
+    const size_t lane_id = threadIdx.x % WARP_SIZE;
+    const size_t warp_id = threadIdx.x / WARP_SIZE;
+
+    sum = __reduce_add_sync(FULL_MASK, sum);
+
+    if constexpr (threads_per_block == WARP_SIZE) {
+        if (lane_id == 0) {
+            *shared_rms_inv = rsqrtf(
+                sum / static_cast<float>(hidden_dim) + eps
+            );
+        }
+        __syncwarp(FULL_MASK);
+        return *shared_rms_inv;
+    } else {
+        if (lane_id == 0) {
+            sdata[warp_id] = sum;
+        }
+        __syncthreads();
+        if (warp_id == 0) {
+            sum = lane_id < num_warps ? sdata[lane_id] : 0.0f;
+            sum = __reduce_add_sync(FULL_MASK, sum);
+            if (lane_id == 0) {
+                *shared_rms_inv = rsqrtf(
+                    sum / static_cast<float>(hidden_dim) + eps
+                );
+            }
+        }
+        __syncthreads();
+        return *shared_rms_inv;
+    }
+}
+
+template<size_t threads_per_block, size_t items_per_thread = 0,
+         size_t hidden_size = 0>
+__global__ void rms_norm_fp32_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    size_t rows, size_t hidden_dim, float eps
+) {
+    constexpr size_t vec_size = 4;
+    const size_t current_hidden_dim = hidden_size > 0
+        ? hidden_size : hidden_dim;
+    const size_t num_vecs = current_hidden_dim / vec_size;
+    const size_t tid = threadIdx.x;
+    const size_t row = blockIdx.x;
+    if (row >= rows) return;
+
+    const float4* row_input = reinterpret_cast<const float4*>(
+        input + row * current_hidden_dim
+    );
+    const float4* weight_vec = reinterpret_cast<const float4*>(weight);
+    float4* row_output = reinterpret_cast<float4*>(
+        output + row * current_hidden_dim
+    );
+    __shared__ float sdata[threads_per_block / WARP_SIZE];
+    __shared__ float rms_inv;
+
+    constexpr size_t cached_items = items_per_thread > 0
+        ? items_per_thread : 1;
+    float4 cached_input[cached_items];
+    float sum = 0.0f;
+    if constexpr (items_per_thread > 0) {
+        #pragma unroll
+        for (size_t item = 0; item < items_per_thread; ++item) {
+            const size_t i = tid + item * threads_per_block;
+            if (i < num_vecs) {
+                const float4 val = row_input[i];
+                cached_input[item] = val;
+                sum += val.x * val.x + val.y * val.y +
+                       val.z * val.z + val.w * val.w;
+            }
+        }
+    } else {
+        for (size_t i = tid; i < num_vecs; i += threads_per_block) {
+            const float4 val = row_input[i];
+            sum += val.x * val.x + val.y * val.y +
+                   val.z * val.z + val.w * val.w;
+        }
+    }
+
+    const float row_rms_inv = rms_inv_reduce<threads_per_block>(
+        sum, current_hidden_dim, eps, sdata, &rms_inv
+    );
+
+    if constexpr (items_per_thread > 0) {
+        #pragma unroll
+        for (size_t item = 0; item < items_per_thread; ++item) {
+            const size_t i = tid + item * threads_per_block;
+            if (i < num_vecs) {
+                const float4 val = cached_input[item];
+                const float4 w = weight_vec[i];
+                float4 out;
+                out.x = val.x * row_rms_inv * w.x;
+                out.y = val.y * row_rms_inv * w.y;
+                out.z = val.z * row_rms_inv * w.z;
+                out.w = val.w * row_rms_inv * w.w;
+                row_output[i] = out;
+            }
+        }
+    } else {
+        for (size_t i = tid; i < num_vecs; i += threads_per_block) {
+            const float4 val = row_input[i];
+            const float4 w = weight_vec[i];
+            float4 out;
+            out.x = val.x * row_rms_inv * w.x;
+            out.y = val.y * row_rms_inv * w.y;
+            out.z = val.z * row_rms_inv * w.z;
+            out.w = val.w * row_rms_inv * w.w;
+            row_output[i] = out;
+        }
+    }
+}
+
+template<size_t threads_per_block, size_t items_per_thread = 0,
+         size_t hidden_size = 0>
+__global__ void rms_norm_fp16_kernel(
+    const half* __restrict__ input,
+    const half* __restrict__ weight,
+    half* __restrict__ output,
+    size_t rows, size_t hidden_dim, float eps
+) {
+    constexpr size_t vec_size = 8;
+    const size_t current_hidden_dim = hidden_size > 0
+        ? hidden_size : hidden_dim;
+    const size_t num_vecs = current_hidden_dim / vec_size;
+    const size_t tid = threadIdx.x;
+    const size_t row = blockIdx.x;
+    if (row >= rows) return;
+
+    const float4* row_input = reinterpret_cast<const float4*>(
+        input + row * current_hidden_dim
+    );
+    const float4* weight_vec = reinterpret_cast<const float4*>(weight);
+    float4* row_output = reinterpret_cast<float4*>(
+        output + row * current_hidden_dim
+    );
+    __shared__ float sdata[threads_per_block / WARP_SIZE];
+    __shared__ float rms_inv;
+
+    constexpr size_t cached_items = items_per_thread > 0
+        ? items_per_thread : 1;
+    float4 cached_input[cached_items];
+    float sum = 0.0f;
+    if constexpr (items_per_thread > 0) {
+        #pragma unroll
+        for (size_t item = 0; item < items_per_thread; ++item) {
+            const size_t i = tid + item * threads_per_block;
+            if (i < num_vecs) {
+                PackHalf8 val;
+                val.packed = row_input[i];
+                cached_input[item] = val.packed;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 value_f = __half22float2(val.data[j]);
+                    sum += value_f.x * value_f.x;
+                    sum += value_f.y * value_f.y;
+                }
+            }
+        }
+    } else {
+        for (size_t i = tid; i < num_vecs; i += threads_per_block) {
+            PackHalf8 val;
+            val.packed = row_input[i];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 value_f = __half22float2(val.data[j]);
+                sum += value_f.x * value_f.x;
+                sum += value_f.y * value_f.y;
+            }
+        }
+    }
+
+    const float row_rms_inv = rms_inv_reduce<threads_per_block>(
+        sum, current_hidden_dim, eps, sdata, &rms_inv
+    );
+
+    if constexpr (items_per_thread > 0) {
+        #pragma unroll
+        for (size_t item = 0; item < items_per_thread; ++item) {
+            const size_t i = tid + item * threads_per_block;
+            if (i < num_vecs) {
+                PackHalf8 val;
+                PackHalf8 w;
+                PackHalf8 out;
+                val.packed = cached_input[item];
+                w.packed = weight_vec[i];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 value_f = __half22float2(val.data[j]);
+                    const float2 scale_f = __half22float2(w.data[j]);
+                    out.data[j] = __floats2half2_rn(
+                        value_f.x * row_rms_inv * scale_f.x,
+                        value_f.y * row_rms_inv * scale_f.y
+                    );
+                }
+                row_output[i] = out.packed;
+            }
+        }
+    } else {
+        for (size_t i = tid; i < num_vecs; i += threads_per_block) {
+            PackHalf8 val;
+            PackHalf8 w;
+            PackHalf8 out;
+            val.packed = row_input[i];
+            w.packed = weight_vec[i];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 value_f = __half22float2(val.data[j]);
+                const float2 scale_f = __half22float2(w.data[j]);
+                out.data[j] = __floats2half2_rn(
+                    value_f.x * row_rms_inv * scale_f.x,
+                    value_f.y * row_rms_inv * scale_f.y
+                );
+            }
+            row_output[i] = out.packed;
+        }
+    }
+}
+
+// Split one 64-thread MACA warp into independent row subgroups. This is
+// useful when one row has fewer vector elements than the native warp width.
+template<typename T, size_t hidden_size, size_t block_warps>
+__global__ void rms_norm_subgroup_rows_kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ weight,
+    T* __restrict__ output,
+    size_t rows, float eps
+) {
+    constexpr size_t vec_size = std::is_same_v<T, float> ? 4 : 8;
+    constexpr size_t vecs_per_row = hidden_size / vec_size;
+    constexpr size_t rows_per_warp = WARP_SIZE / vecs_per_row;
+    constexpr size_t rows_per_block = block_warps * rows_per_warp;
+    static_assert(vecs_per_row <= WARP_SIZE,
+                  "subgroup kernel requires at most one warp per row");
+    static_assert((vecs_per_row & (vecs_per_row - 1)) == 0,
+                  "subgroup width must be a power of two");
+
+    const size_t warp_id = threadIdx.x / WARP_SIZE;
+    const size_t lane_id = threadIdx.x % WARP_SIZE;
+    const size_t subgroup_id = lane_id / vecs_per_row;
+    const size_t lane_in_row = lane_id % vecs_per_row;
+    const size_t row = blockIdx.x * rows_per_block +
+                       warp_id * rows_per_warp + subgroup_id;
+    if (row >= rows) return;
+
+    constexpr uint64_t base_mask = vecs_per_row == WARP_SIZE
+        ? FULL_MASK : ((uint64_t{1} << vecs_per_row) - 1);
+    const uint64_t subgroup_mask = base_mask <<
+        (subgroup_id * vecs_per_row);
+    const size_t vec_index = row * vecs_per_row + lane_in_row;
+    const float4 packed_input = reinterpret_cast<const float4*>(input)[vec_index];
+
+    float sum = 0.0f;
+    if constexpr (std::is_same_v<T, float>) {
+        sum = packed_input.x * packed_input.x +
+              packed_input.y * packed_input.y +
+              packed_input.z * packed_input.z +
+              packed_input.w * packed_input.w;
+    } else {
+        PackHalf8 val;
+        val.packed = packed_input;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 value_f = __half22float2(val.data[j]);
+            sum += value_f.x * value_f.x;
+            sum += value_f.y * value_f.y;
+        }
+    }
+
+    sum = __reduce_add_sync(subgroup_mask, sum);
+    const float row_rms_inv = rsqrtf(
+        sum / static_cast<float>(hidden_size) + eps
+    );
+    const float4 packed_weight =
+        reinterpret_cast<const float4*>(weight)[lane_in_row];
+
+    if constexpr (std::is_same_v<T, float>) {
+        float4 out;
+        out.x = packed_input.x * row_rms_inv * packed_weight.x;
+        out.y = packed_input.y * row_rms_inv * packed_weight.y;
+        out.z = packed_input.z * row_rms_inv * packed_weight.z;
+        out.w = packed_input.w * row_rms_inv * packed_weight.w;
+        reinterpret_cast<float4*>(output)[vec_index] = out;
+    } else {
+        PackHalf8 val;
+        PackHalf8 weight_vec;
+        PackHalf8 out;
+        val.packed = packed_input;
+        weight_vec.packed = packed_weight;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 value_f = __half22float2(val.data[j]);
+            const float2 scale_f = __half22float2(weight_vec.data[j]);
+            out.data[j] = __floats2half2_rn(
+                value_f.x * row_rms_inv * scale_f.x,
+                value_f.y * row_rms_inv * scale_f.y
+            );
+        }
+        reinterpret_cast<float4*>(output)[vec_index] = out.packed;
+    }
+}
+
+// Each MACA warp owns one row. Multiple rows share a block without
+// block-wide synchronization, which reduces scheduling overhead for short rows.
+template<typename T, size_t warps_per_block, size_t items_per_thread,
+         size_t hidden_size = 0>
+__global__ void rms_norm_fused_rows_kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ weight,
+    T* __restrict__ output,
+    size_t rows, size_t hidden_dim, float eps
+) {
+    constexpr size_t vec_size = std::is_same_v<T, float> ? 4 : 8;
+    const size_t current_hidden_dim = hidden_size > 0
+        ? hidden_size : hidden_dim;
+    const size_t warp_id = threadIdx.x / WARP_SIZE;
+    const size_t lane_id = threadIdx.x % WARP_SIZE;
+    const size_t row = blockIdx.x * warps_per_block + warp_id;
+    if (row >= rows) return;
+
+    const size_t num_vecs = current_hidden_dim / vec_size;
+    const size_t row_offset = row * current_hidden_dim;
+    const float4* row_input = reinterpret_cast<const float4*>(
+        input + row_offset
+    );
+    const float4* weight_vec = reinterpret_cast<const float4*>(weight);
+    float4* row_output = reinterpret_cast<float4*>(output + row_offset);
+
+    float4 cached_input[items_per_thread];
+    float sum = 0.0f;
+    #pragma unroll
+    for (size_t item = 0; item < items_per_thread; ++item) {
+        const size_t i = lane_id + item * WARP_SIZE;
+        if (i < num_vecs) {
+            cached_input[item] = row_input[i];
+            if constexpr (std::is_same_v<T, float>) {
+                const float4 val = cached_input[item];
+                sum += val.x * val.x + val.y * val.y +
+                       val.z * val.z + val.w * val.w;
+            } else {
+                PackHalf8 val;
+                val.packed = cached_input[item];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 value_f = __half22float2(val.data[j]);
+                    sum += value_f.x * value_f.x;
+                    sum += value_f.y * value_f.y;
+                }
+            }
+        }
+    }
+
+    sum = __reduce_add_sync(FULL_MASK, sum);
+    const float row_rms_inv = __shfl_sync(
+        FULL_MASK,
+        rsqrtf(sum / static_cast<float>(current_hidden_dim) + eps),
+        0
+    );
+
+    #pragma unroll
+    for (size_t item = 0; item < items_per_thread; ++item) {
+        const size_t i = lane_id + item * WARP_SIZE;
+        if (i < num_vecs) {
+            if constexpr (std::is_same_v<T, float>) {
+                const float4 val = cached_input[item];
+                const float4 w = weight_vec[i];
+                float4 out;
+                out.x = val.x * row_rms_inv * w.x;
+                out.y = val.y * row_rms_inv * w.y;
+                out.z = val.z * row_rms_inv * w.z;
+                out.w = val.w * row_rms_inv * w.w;
+                row_output[i] = out;
+            } else {
+                PackHalf8 val;
+                PackHalf8 w;
+                PackHalf8 out;
+                val.packed = cached_input[item];
+                w.packed = weight_vec[i];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 value_f = __half22float2(val.data[j]);
+                    const float2 scale_f = __half22float2(w.data[j]);
+                    out.data[j] = __floats2half2_rn(
+                        value_f.x * row_rms_inv * scale_f.x,
+                        value_f.y * row_rms_inv * scale_f.y
+                    );
+                }
+                row_output[i] = out.packed;
+            }
+        }
+    }
+}
+
+template<typename T, size_t threads_per_block>
+__global__ void rms_norm_scalar_kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ weight,
+    T* __restrict__ output,
+    size_t rows, size_t hidden_dim, float eps
+) {
+    const size_t tid = threadIdx.x;
+    const size_t row = blockIdx.x;
+    if (row >= rows) return;
+
+    const T* row_input = input + row * hidden_dim;
+    T* row_output = output + row * hidden_dim;
+    __shared__ float sdata[threads_per_block / WARP_SIZE];
+    __shared__ float rms_inv;
+
+    float sum = 0.0f;
+    for (size_t i = tid; i < hidden_dim; i += threads_per_block) {
+        float val;
+        if constexpr (std::is_same_v<T, float>) {
+            val = row_input[i];
+        } else {
+            val = __half2float(row_input[i]);
+        }
+        sum += val * val;
+    }
+
+    const float row_rms_inv = rms_inv_reduce<threads_per_block>(
+        sum, hidden_dim, eps, sdata, &rms_inv
+    );
+
+    for (size_t i = tid; i < hidden_dim; i += threads_per_block) {
+        if constexpr (std::is_same_v<T, float>) {
+            row_output[i] = row_input[i] * row_rms_inv * weight[i];
+        } else {
+            row_output[i] = __float2half_rn(
+                __half2float(row_input[i]) * row_rms_inv *
+                __half2float(weight[i])
+            );
+        }
+    }
+}
+
+
+// Mixed vector/scalar kernels for rows whose stride is not 16-byte aligned.
+// A short scalar prefix aligns input/output; weight is loaded scalarly because
+// its base alignment does not follow the per-row prefix.
+template<size_t threads_per_block>
+__global__ void rms_norm_fp32_mixed_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    size_t rows, size_t hidden_dim, float eps
+) {
+    constexpr size_t vec_size = 4;
+    const size_t tid = threadIdx.x;
+    const size_t row = blockIdx.x;
+    if (row >= rows) return;
+
+    const size_t row_offset = row * hidden_dim;
+    const size_t prefix = (vec_size - row_offset % vec_size) % vec_size;
+    const size_t num_vecs = (hidden_dim - prefix) / vec_size;
+    const size_t tail = prefix + num_vecs * vec_size;
+    const float* row_input = input + row_offset;
+    float* row_output = output + row_offset;
+    const float4* row_input_vec = reinterpret_cast<const float4*>(
+        row_input + prefix
+    );
+    float4* row_output_vec = reinterpret_cast<float4*>(row_output + prefix);
+    __shared__ float sdata[threads_per_block / WARP_SIZE];
+    __shared__ float rms_inv;
+
+    constexpr size_t items_per_thread = 2;
+    float4 cached_input[items_per_thread];
+    float sum = 0.0f;
+    #pragma unroll
+    for (size_t item = 0; item < items_per_thread; ++item) {
+        const size_t i = tid + item * threads_per_block;
+        if (i < num_vecs) {
+            cached_input[item] = row_input_vec[i];
+            sum += cached_input[item].x * cached_input[item].x +
+                   cached_input[item].y * cached_input[item].y +
+                   cached_input[item].z * cached_input[item].z +
+                   cached_input[item].w * cached_input[item].w;
+        }
+    }
+    if (tid < prefix) {
+        const float val = row_input[tid];
+        sum += val * val;
+    }
+    if (tail + tid < hidden_dim) {
+        const float val = row_input[tail + tid];
+        sum += val * val;
+    }
+
+    const float row_rms_inv = rms_inv_reduce<threads_per_block>(
+        sum, hidden_dim, eps, sdata, &rms_inv
+    );
+
+    #pragma unroll
+    for (size_t item = 0; item < items_per_thread; ++item) {
+        const size_t i = tid + item * threads_per_block;
+        if (i < num_vecs) {
+            const size_t col = prefix + i * vec_size;
+            float4 out;
+            out.x = cached_input[item].x * row_rms_inv * weight[col];
+            out.y = cached_input[item].y * row_rms_inv * weight[col + 1];
+            out.z = cached_input[item].z * row_rms_inv * weight[col + 2];
+            out.w = cached_input[item].w * row_rms_inv * weight[col + 3];
+            row_output_vec[i] = out;
+        }
+    }
+    if (tid < prefix) {
+        row_output[tid] = row_input[tid] * row_rms_inv * weight[tid];
+    }
+    if (tail + tid < hidden_dim) {
+        row_output[tail + tid] = row_input[tail + tid] * row_rms_inv *
+                                 weight[tail + tid];
+    }
+}

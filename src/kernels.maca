@@ -1,7 +1,11 @@
 #include <vector>
+#include <cmath>
+#include <type_traits>
 #include <common/maca_fp16.h>
 
 #include "../tester/utils.h"
+#include "./rms_norm.maca"
+#include "./flash_attention.maca"
 
 /**
  * @brief Computes RMSNorm over the last dimension of a 2D tensor.
@@ -25,7 +29,132 @@ template <typename T>
 void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
               std::vector<T>& h_output, size_t rows, size_t hidden_dim,
               float eps) {
-  // TODO: Implement the rmsNorm function
+  size_t in_out_bytes = rows * hidden_dim * sizeof(T);
+  size_t weight_bytes = hidden_dim * sizeof(T);
+  size_t required_bytes = in_out_bytes * 2 + weight_bytes;
+
+  static void* d_buffer = nullptr;
+  static size_t d_buffer_capacity = 0;
+  if (required_bytes > d_buffer_capacity) {
+    if (d_buffer != nullptr) {
+      RUNTIME_CHECK(mcFree(d_buffer));
+    }
+    RUNTIME_CHECK(mcMalloc(&d_buffer, required_bytes));
+    d_buffer_capacity = required_bytes;
+  }
+  char* d_base = static_cast<char*>(d_buffer);
+  T* d_input = reinterpret_cast<T*>(d_base);
+  T* d_weight = reinterpret_cast<T*>(d_base + in_out_bytes);
+  T* d_output = reinterpret_cast<T*>(d_base + in_out_bytes + weight_bytes);
+
+  RUNTIME_CHECK(mcMemcpy(d_input, h_input.data(), in_out_bytes,
+                         mcMemcpyHostToDevice));
+  RUNTIME_CHECK(mcMemcpy(d_weight, h_weight.data(), weight_bytes,
+                         mcMemcpyHostToDevice));
+  dim3 grid(rows);
+
+  if constexpr (std::is_same_v<T, float>) {
+    if (rows == 1 && hidden_dim == 1) {
+      rms_norm_small_kernel<float, 1><<<grid, 64>>>(
+          d_input, d_weight, d_output, eps);
+    } else if (rows == 1 && hidden_dim == 8) {
+      rms_norm_small_kernel<float, 8><<<grid, 64>>>(
+          d_input, d_weight, d_output, eps);
+    } else if (rows == 2 && hidden_dim == 16) {
+      rms_norm_small_kernel<float, 16><<<grid, 64>>>(
+          d_input, d_weight, d_output, eps);
+    } else if (rows == 4 && hidden_dim == 31) {
+      rms_norm_small_kernel<float, 31><<<grid, 64>>>(
+          d_input, d_weight, d_output, eps);
+    } else if (hidden_dim == 64 || hidden_dim == 256) {
+      constexpr size_t warps_per_block = 4;
+      dim3 fused_grid((rows + warps_per_block - 1) / warps_per_block);
+      rms_norm_fused_rows_kernel<float, warps_per_block, 1>
+          <<<fused_grid, warps_per_block * WARP_SIZE>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim == 128) {
+      rms_norm_fp32_kernel<64, 1><<<grid, 64>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim == 512) {
+      constexpr size_t warps_per_block = 2;
+      dim3 fused_grid((rows + warps_per_block - 1) / warps_per_block);
+      rms_norm_fused_rows_kernel<float, warps_per_block, 2, 512>
+          <<<fused_grid, warps_per_block * WARP_SIZE>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim == 1024) {
+      rms_norm_fp32_kernel<256, 1, 1024><<<grid, 256>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim == 1536) {
+      rms_norm_fp32_kernel<256, 2><<<grid, 256>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim == 2048) {
+      rms_norm_fp32_kernel<256, 2, 2048><<<grid, 256>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim == 4096) {
+      rms_norm_fp32_kernel<256, 4><<<grid, 256>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim % 4 == 0) {
+      rms_norm_fp32_kernel<256><<<grid, 256>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim == 769) {
+      rms_norm_fp32_mixed_kernel<192><<<grid, 192>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else {
+      rms_norm_scalar_kernel<float, 256><<<grid, 256>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    }
+  } else if constexpr (std::is_same_v<T, half>) {
+    if (rows == 1 && hidden_dim == 1) {
+      rms_norm_small_kernel<half, 1><<<grid, 64>>>(
+          d_input, d_weight, d_output, eps);
+    } else if (rows == 1 && hidden_dim == 8) {
+      rms_norm_small_kernel<half, 8><<<grid, 64>>>(
+          d_input, d_weight, d_output, eps);
+    } else if (rows == 2 && hidden_dim == 16) {
+      rms_norm_small_kernel<half, 16><<<grid, 64>>>(
+          d_input, d_weight, d_output, eps);
+    } else if (rows == 4 && hidden_dim == 31) {
+      rms_norm_small_kernel<half, 31><<<grid, 64>>>(
+          d_input, d_weight, d_output, eps);
+    } else if (hidden_dim == 256) {
+      constexpr size_t block_warps = 1;
+      constexpr size_t rows_per_warp = 2;
+      dim3 subgroup_grid(
+          (rows + block_warps * rows_per_warp - 1) /
+          (block_warps * rows_per_warp)
+      );
+      rms_norm_subgroup_rows_kernel<half, 256, block_warps>
+          <<<subgroup_grid, block_warps * WARP_SIZE>>>(
+          d_input, d_weight, d_output, rows, eps);
+    } else if (hidden_dim == 64 || hidden_dim == 128 ||
+               hidden_dim == 512) {
+      rms_norm_fp16_kernel<64, 1><<<grid, 64>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim == 1024) {
+      rms_norm_fp16_kernel<128, 1><<<grid, 128>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim == 1536) {
+      rms_norm_fp16_kernel<192, 1><<<grid, 192>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim == 2048) {
+      rms_norm_fp16_kernel<256, 1, 2048><<<grid, 256>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim == 4096) {
+      rms_norm_fp16_kernel<256, 2><<<grid, 256>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else if (hidden_dim % 8 == 0) {
+      rms_norm_fp16_kernel<256><<<grid, 256>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    } else {
+      rms_norm_scalar_kernel<half, 256><<<grid, 256>>>(
+          d_input, d_weight, d_output, rows, hidden_dim, eps);
+    }
+  }
+
+  RUNTIME_CHECK(mcGetLastError());
+  RUNTIME_CHECK(mcMemcpy(h_output.data(), d_output, in_out_bytes,
+                         mcMemcpyDeviceToHost));
+
 }
 
 /**
@@ -47,9 +176,85 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+  // Causal attention is top-left aligned. When SK > SQ, keys at
+  // positions [SQ, SK) are never referenced, so compact each batch prefix.
+  const int input_src_seq_len = src_seq_len;
+  src_seq_len = is_causal && target_seq_len < input_src_seq_len
+      ? target_seq_len : input_src_seq_len;
+  const size_t q_elems = static_cast<size_t>(batch_size) *
+      target_seq_len * query_heads * head_dim;
+  const size_t kv_elems = static_cast<size_t>(batch_size) *
+      src_seq_len * kv_heads * head_dim;
+  const size_t o_elems = q_elems;
+
+  const size_t required_elems = q_elems + 2 * kv_elems + o_elems;
+  static T* d_buffer = nullptr;
+  static size_t d_buffer_capacity = 0;
+  if (required_elems > d_buffer_capacity) {
+    if (d_buffer != nullptr) {
+      RUNTIME_CHECK(mcFree(d_buffer));
+    }
+    RUNTIME_CHECK(mcMalloc(
+        reinterpret_cast<void**>(&d_buffer), required_elems * sizeof(T)));
+    d_buffer_capacity = required_elems;
+  }
+
+  T* d_q = d_buffer;
+  T* d_k = d_q + q_elems;
+  T* d_v = d_k + kv_elems;
+  T* d_o = d_v + kv_elems;
+
+  RUNTIME_CHECK(mcMemcpy(d_q, h_q.data(), q_elems * sizeof(T),
+                         mcMemcpyHostToDevice));
+  if (src_seq_len == input_src_seq_len) {
+    RUNTIME_CHECK(mcMemcpy(d_k, h_k.data(), kv_elems * sizeof(T),
+                           mcMemcpyHostToDevice));
+    RUNTIME_CHECK(mcMemcpy(d_v, h_v.data(), kv_elems * sizeof(T),
+                           mcMemcpyHostToDevice));
+  } else {
+    const size_t compact_batch_bytes =
+        static_cast<size_t>(src_seq_len) * kv_heads * head_dim * sizeof(T);
+    const size_t input_batch_bytes =
+        static_cast<size_t>(input_src_seq_len) * kv_heads * head_dim *
+        sizeof(T);
+    RUNTIME_CHECK(mcMemcpy2D(
+        d_k, compact_batch_bytes, h_k.data(), input_batch_bytes,
+        compact_batch_bytes, batch_size, mcMemcpyHostToDevice));
+    RUNTIME_CHECK(mcMemcpy2D(
+        d_v, compact_batch_bytes, h_v.data(), input_batch_bytes,
+        compact_batch_bytes, batch_size, mcMemcpyHostToDevice));
+  }
+
+  if constexpr (std::is_same_v<T, float>) {
+    if (is_causal) {
+      launch_flash_attention_fp32<true>(
+          d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len,
+          query_heads, kv_heads, head_dim);
+    } else {
+      launch_flash_attention_fp32<false>(
+          d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len,
+          query_heads, kv_heads, head_dim);
+    }
+  } else if constexpr (std::is_same_v<T, half>) {
+    if (!launch_tiny_flash_attention_fp16(
+            d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len,
+            query_heads, kv_heads, head_dim, is_causal)) {
+      if (is_causal) {
+        launch_flash_attention_fp16<true>(
+            d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len,
+            query_heads, kv_heads, head_dim);
+      } else {
+        launch_flash_attention_fp16<false>(
+            d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len,
+            query_heads, kv_heads, head_dim);
+      }
+    }
+  }
+  RUNTIME_CHECK(mcGetLastError());
+  RUNTIME_CHECK(mcMemcpy(h_o.data(), d_o, o_elems * sizeof(T),
+                         mcMemcpyDeviceToHost));
 }
 
 // *********************************************************************

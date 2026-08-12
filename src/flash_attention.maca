@@ -1,0 +1,1111 @@
+#pragma once
+
+#include <common/maca_fp16.h>
+#include <__clang_maca_mma_functions.h>
+
+namespace wmma = mxmaca::wmma;
+
+template <
+    int HEAD_DIM,
+    bool IS_CAUSAL,
+    int NUM_WARPS,
+    int Bc
+>
+__global__ void flash_attention_fp16_wmma(
+    const half* __restrict__ q,
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    half* __restrict__ o,
+    int tq, int tk, int hq, int hkv)
+{
+    constexpr int MMA_ATOM = 16;
+    constexpr int Br = MMA_ATOM * NUM_WARPS;
+    constexpr int NUM_MMA_PER_BC = Bc / MMA_ATOM;
+    constexpr int NUM_THREADS = 64 * NUM_WARPS;
+    constexpr int NUM_MMA_PER_HEAD_DIM = HEAD_DIM / MMA_ATOM;
+    constexpr int VEC_ELEMS = 8;
+    constexpr int VECS_PER_ROW = HEAD_DIM / VEC_ELEMS;
+    constexpr int Q_VECS_PER_TILE = MMA_ATOM * VECS_PER_ROW;
+    constexpr int KV_VECS_PER_TILE = Bc * VECS_PER_ROW;
+    constexpr int SMEM_STRIDE = HEAD_DIM + 8;
+    const int tid = threadIdx.x;
+    const int lane = tid & 63;
+    const int warp_id = tid >> 6;
+    const int block_Br_begin = blockIdx.x * Br;
+    const int tile_Br_begin = block_Br_begin + warp_id * MMA_ATOM;
+    const int query_head = blockIdx.y;
+    const int batch = blockIdx.z;
+    const int kv_head = query_head / (hq / hkv);
+    __shared__ __align__(16) half smem_Q[Br * SMEM_STRIDE];
+    __shared__ __align__(16) half smem_K[Bc * SMEM_STRIDE];
+    __shared__ __align__(16) half smem_V[Bc * SMEM_STRIDE];
+    __shared__ half smem_P[NUM_WARPS * MMA_ATOM * Bc];
+    __shared__ float smem_S[NUM_WARPS * MMA_ATOM * Bc];
+    __shared__ float reg_m_block[Br];
+    __shared__ float reg_l_block[Br];
+    __shared__ float reg_alpha[Br];
+    half* warp_smem_P = smem_P + warp_id * MMA_ATOM * Bc;
+    float* warp_smem_S = smem_S + warp_id * MMA_ATOM * Bc;
+    const int warp_row_begin = warp_id * MMA_ATOM;
+
+    // Load Q tile from global memory to shared memory
+    for (int vec_id = lane; vec_id < Q_VECS_PER_TILE; vec_id += 64) {
+        int r = vec_id / VECS_PER_ROW;
+        int d = (vec_id - r * VECS_PER_ROW) * VEC_ELEMS;
+        int qi = tile_Br_begin + r;
+        int4* smem_ptr =
+            reinterpret_cast<int4*>(
+                smem_Q + (warp_row_begin + r) * SMEM_STRIDE + d);
+        if (qi < tq) {
+            const half* gmem_ptr =
+                q + ((batch * tq + qi) * hq + query_head) * HEAD_DIM + d;
+            *smem_ptr = *reinterpret_cast<const int4*>(gmem_ptr);
+        } else {
+            *smem_ptr = make_int4(0, 0, 0, 0);
+        }
+    }
+    if (lane < MMA_ATOM) {
+        reg_m_block[warp_row_begin + lane] = -INFINITY;
+        reg_l_block[warp_row_begin + lane] = 0.0f;
+    }
+    __syncthreads();
+
+    // Larger head dimensions reuse Q enough to amortize keeping the fragments
+    // in registers. Small heads retain the lower-register-pressure path.
+    wmma::fragment<wmma::matrix_a, MMA_ATOM, MMA_ATOM,
+                   MMA_ATOM, half, wmma::row_major>
+        reg_Q_cache[NUM_MMA_PER_HEAD_DIM];
+    if constexpr (HEAD_DIM >= 64) {
+        #pragma unroll
+        for (int n = 0; n < NUM_MMA_PER_HEAD_DIM; ++n) {
+            wmma::load_matrix_sync(
+                reg_Q_cache[n],
+                smem_Q + warp_row_begin * SMEM_STRIDE + n * MMA_ATOM,
+                SMEM_STRIDE);
+        }
+    }
+
+    // Initialize O accumulator in registers
+    wmma::fragment<wmma::accumulator, MMA_ATOM, MMA_ATOM, MMA_ATOM, float>
+            reg_O[NUM_MMA_PER_HEAD_DIM];
+    #pragma unroll
+    for (int n = 0; n < NUM_MMA_PER_HEAD_DIM; ++n) {
+        wmma::fill_fragment(reg_O[n], 0.0f);
+    }
+
+    // Top-left causal attention only consumes keys covered by this Q tile.
+    const int causal_tk = block_Br_begin + Br < tq
+        ? block_Br_begin + Br : tq;
+    const int effective_tk = IS_CAUSAL && causal_tk < tk ? causal_tk : tk;
+    for (int k0 = 0; k0 < effective_tk; k0 += Bc) {
+        for (int vec_id = tid; vec_id < KV_VECS_PER_TILE;
+             vec_id += NUM_THREADS) {
+            int r = vec_id / VECS_PER_ROW;
+            int d = (vec_id - r * VECS_PER_ROW) * VEC_ELEMS;
+            int ki = k0 + r;
+            int4* smem_K_ptr =
+                reinterpret_cast<int4*>(smem_K + r * SMEM_STRIDE + d);
+            int4* smem_V_ptr =
+                reinterpret_cast<int4*>(smem_V + r * SMEM_STRIDE + d);
+            if (ki < effective_tk) {
+                size_t off =
+                    ((size_t)(batch * tk + ki) * hkv + kv_head) *
+                    HEAD_DIM + d;
+                *smem_K_ptr = *reinterpret_cast<const int4*>(k + off);
+                *smem_V_ptr = *reinterpret_cast<const int4*>(v + off);
+            } else {
+                *smem_K_ptr = make_int4(0, 0, 0, 0);
+                *smem_V_ptr = make_int4(0, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+
+        // Do Q @ K^T for all key subtiles in this Bc tile
+        #pragma unroll
+        for (int tile_N_id = 0; tile_N_id < NUM_MMA_PER_BC; ++tile_N_id) {
+            wmma::fragment<wmma::accumulator, MMA_ATOM, MMA_ATOM,
+                           MMA_ATOM, float> reg_S;
+            wmma::fill_fragment(reg_S, 0.0f);
+            #pragma unroll
+            for (int n = 0; n < NUM_MMA_PER_HEAD_DIM; ++n) {
+                wmma::fragment<wmma::matrix_b, MMA_ATOM, MMA_ATOM,
+                               MMA_ATOM, half, wmma::col_major> reg_K;
+                wmma::load_matrix_sync(
+                    reg_K,
+                    smem_K + tile_N_id * MMA_ATOM * SMEM_STRIDE +
+                        n * MMA_ATOM,
+                    SMEM_STRIDE);
+                if constexpr (HEAD_DIM >= 64) {
+                    wmma::mma_sync(reg_S, reg_Q_cache[n], reg_K, reg_S);
+                } else {
+                    wmma::fragment<wmma::matrix_a, MMA_ATOM, MMA_ATOM,
+                                   MMA_ATOM, half, wmma::row_major> reg_Q;
+                    wmma::load_matrix_sync(
+                        reg_Q,
+                        smem_Q + warp_row_begin * SMEM_STRIDE + n * MMA_ATOM,
+                        SMEM_STRIDE);
+                    wmma::mma_sync(reg_S, reg_Q, reg_K, reg_S);
+                }
+            }
+            wmma::store_matrix_sync(
+                warp_smem_S + tile_N_id * MMA_ATOM, reg_S,
+                Bc, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // Online softmax: four lanes cooperate on each row
+        const int softmax_row = lane >> 2;
+        const int softmax_lane = lane & 3;
+        const int qi = tile_Br_begin + softmax_row;
+        const int block_row = warp_row_begin + softmax_row;
+        const float scale = rsqrtf((float)HEAD_DIM);
+        float m = -INFINITY;
+        #pragma unroll
+        for (int c = softmax_lane; c < Bc; c += 4) {
+            int ki = k0 + c;
+            if (qi < tq && ki < tk && (!IS_CAUSAL || ki <= qi)) {
+                m = fmaxf(m, warp_smem_S[softmax_row * Bc + c] * scale);
+            }
+        }
+        m = fmaxf(m, __shfl_xor_sync(UINT64_MAX, m, 1, 4));
+        m = fmaxf(m, __shfl_xor_sync(UINT64_MAX, m, 2, 4));
+        const float new_m = fmaxf(reg_m_block[block_row], m);
+        const float a = reg_l_block[block_row] == 0.0f
+            ? 0.0f : __expf(reg_m_block[block_row] - new_m);
+        float sum = 0.0f;
+        #pragma unroll
+        for (int c = softmax_lane; c < Bc; c += 4) {
+            int ki = k0 + c;
+            float p = 0.0f;
+            if (qi < tq && ki < tk && (!IS_CAUSAL || ki <= qi)) {
+                p = __expf(
+                    warp_smem_S[softmax_row * Bc + c] * scale - new_m);
+            }
+            warp_smem_P[softmax_row * Bc + c] = __float2half_rn(p);
+            sum += p;
+        }
+        sum += __shfl_xor_sync(UINT64_MAX, sum, 1, 4);
+        sum += __shfl_xor_sync(UINT64_MAX, sum, 2, 4);
+        if (softmax_lane == 0) {
+            reg_alpha[block_row] = a;
+            reg_l_block[block_row] =
+                a * reg_l_block[block_row] + sum;
+            reg_m_block[block_row] = new_m;
+        }
+        __syncthreads();
+
+        // Do P @ V and rescale the previous O accumulator
+        int frag_row = (lane >> 4) * 4;
+        #pragma unroll
+        for (int n = 0; n < NUM_MMA_PER_HEAD_DIM; ++n) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                reg_O[n].x[i] *= reg_alpha[warp_row_begin + frag_row + i];
+            }
+            #pragma unroll
+            for (int tile_N_id = 0; tile_N_id < NUM_MMA_PER_BC; ++tile_N_id) {
+                wmma::fragment<wmma::matrix_a, MMA_ATOM, MMA_ATOM,
+                               MMA_ATOM, half, wmma::row_major> reg_P;
+                wmma::fragment<wmma::matrix_b, MMA_ATOM, MMA_ATOM,
+                               MMA_ATOM, half, wmma::row_major> reg_V;
+                wmma::load_matrix_sync(
+                    reg_P, warp_smem_P + tile_N_id * MMA_ATOM, Bc);
+                wmma::load_matrix_sync(
+                    reg_V,
+                    smem_V + tile_N_id * MMA_ATOM * SMEM_STRIDE +
+                        n * MMA_ATOM,
+                    SMEM_STRIDE);
+                wmma::mma_sync(reg_O[n], reg_P, reg_V, reg_O[n]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // Update final O
+    #pragma unroll
+    for (int n = 0; n < NUM_MMA_PER_HEAD_DIM; ++n) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            reg_O[n].x[i] /= reg_l_block[warp_row_begin + (lane >> 4) * 4 + i];
+        }
+        wmma::store_matrix_sync(
+            warp_smem_S, reg_O[n], MMA_ATOM, wmma::mem_row_major);
+        __syncthreads();
+        if (lane < 32) {
+            const int row = lane >> 1;
+            const int chunk = lane & 1;
+            const int d = n * MMA_ATOM + chunk * VEC_ELEMS;
+            const int qi = tile_Br_begin + row;
+            if (qi < tq) {
+                union {
+                    int4 vector;
+                    half elements[VEC_ELEMS];
+                } packed;
+                #pragma unroll
+                for (int i = 0; i < VEC_ELEMS; ++i) {
+                    packed.elements[i] = __float2half_rn(
+                        warp_smem_S[row * MMA_ATOM + chunk * VEC_ELEMS + i]);
+                }
+                half* gmem_ptr =
+                    o + ((batch * tq + qi) * hq + query_head) * HEAD_DIM + d;
+                *reinterpret_cast<int4*>(gmem_ptr) = packed.vector;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <bool IS_CAUSAL>
+__global__ void flash_attention_fp16_wmma_d8(
+    const half* __restrict__ q,
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    half* __restrict__ o,
+    int tq, int tk, int hq, int hkv)
+{
+    constexpr int Br = 16;
+    constexpr int Bc = 8;
+    const int lane = threadIdx.x;
+    const int tile_Br_begin = blockIdx.x * Br;
+    const int query_head = blockIdx.y;
+    const int batch = blockIdx.z;
+    const int kv_head = query_head / (hq / hkv);
+
+    __shared__ __align__(16) half smem_Q[Br * 8];
+    __shared__ __align__(16) half smem_K[Bc * 8];
+    __shared__ __align__(16) half smem_V[Bc * 8];
+    __shared__ half smem_P[Br * Bc];
+    __shared__ float smem_S[Br * Bc];
+    __shared__ float reg_m_block[Br];
+    __shared__ float reg_l_block[Br];
+    __shared__ float reg_alpha[Br];
+
+    if (lane < Br) {
+        const int qi = tile_Br_begin + lane;
+        int4* smem_ptr = reinterpret_cast<int4*>(smem_Q + lane * 8);
+        if (qi < tq) {
+            const half* gmem_ptr =
+                q + ((batch * tq + qi) * hq + query_head) * 8;
+            *smem_ptr = *reinterpret_cast<const int4*>(gmem_ptr);
+        } else {
+            *smem_ptr = make_int4(0, 0, 0, 0);
+        }
+        reg_m_block[lane] = -INFINITY;
+        reg_l_block[lane] = 0.0f;
+    }
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, Br, Bc, Bc,
+                   half, wmma::row_major> reg_Q;
+    wmma::fragment<wmma::accumulator, Br, Bc, Bc, float> reg_O;
+    wmma::load_matrix_sync(reg_Q, smem_Q, 8);
+    wmma::fill_fragment(reg_O, 0.0f);
+
+    const int causal_tk = tile_Br_begin + Br < tq
+        ? tile_Br_begin + Br : tq;
+    const int effective_tk = IS_CAUSAL && causal_tk < tk ? causal_tk : tk;
+    for (int k0 = 0; k0 < effective_tk; k0 += Bc) {
+        if (lane < Bc) {
+            const int ki = k0 + lane;
+            int4* smem_K_ptr = reinterpret_cast<int4*>(smem_K + lane * 8);
+            int4* smem_V_ptr = reinterpret_cast<int4*>(smem_V + lane * 8);
+            if (ki < effective_tk) {
+                const size_t off =
+                    ((size_t)(batch * tk + ki) * hkv + kv_head) * 8;
+                *smem_K_ptr = *reinterpret_cast<const int4*>(k + off);
+                *smem_V_ptr = *reinterpret_cast<const int4*>(v + off);
+            } else {
+                *smem_K_ptr = make_int4(0, 0, 0, 0);
+                *smem_V_ptr = make_int4(0, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_b, Br, Bc, Bc,
+                       half, wmma::col_major> reg_K;
+        wmma::fragment<wmma::accumulator, Br, Bc, Bc, float> reg_S;
+        wmma::load_matrix_sync(reg_K, smem_K, 8);
+        wmma::fill_fragment(reg_S, 0.0f);
+        wmma::mma_sync(reg_S, reg_Q, reg_K, reg_S);
+        wmma::store_matrix_sync(smem_S, reg_S, Bc, wmma::mem_row_major);
+        __syncthreads();
+
+        const int softmax_row = lane >> 2;
+        const int softmax_lane = lane & 3;
+        const int qi = tile_Br_begin + softmax_row;
+        constexpr float scale = 0.3535533905932738f;
+        float m = -INFINITY;
+        #pragma unroll
+        for (int c = softmax_lane; c < Bc; c += 4) {
+            const int ki = k0 + c;
+            if (qi < tq && ki < tk && (!IS_CAUSAL || ki <= qi)) {
+                m = fmaxf(m, smem_S[softmax_row * Bc + c] * scale);
+            }
+        }
+        m = fmaxf(m, __shfl_xor_sync(UINT64_MAX, m, 1, 4));
+        m = fmaxf(m, __shfl_xor_sync(UINT64_MAX, m, 2, 4));
+        const float new_m = fmaxf(reg_m_block[softmax_row], m);
+        const float a = reg_l_block[softmax_row] == 0.0f
+            ? 0.0f : __expf(reg_m_block[softmax_row] - new_m);
+        float sum = 0.0f;
+        #pragma unroll
+        for (int c = softmax_lane; c < Bc; c += 4) {
+            const int ki = k0 + c;
+            float probability = 0.0f;
+            if (qi < tq && ki < tk && (!IS_CAUSAL || ki <= qi)) {
+                probability = __expf(
+                    smem_S[softmax_row * Bc + c] * scale - new_m);
+            }
+            smem_P[softmax_row * Bc + c] =
+                __float2half_rn(probability);
+            sum += probability;
+        }
+        sum += __shfl_xor_sync(UINT64_MAX, sum, 1, 4);
+        sum += __shfl_xor_sync(UINT64_MAX, sum, 2, 4);
+        if (softmax_lane == 0) {
+            reg_alpha[softmax_row] = a;
+            reg_l_block[softmax_row] =
+                a * reg_l_block[softmax_row] + sum;
+            reg_m_block[softmax_row] = new_m;
+        }
+        __syncthreads();
+
+        const int frag_row = (lane >> 4) * 4;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            reg_O.x[i] *= reg_alpha[frag_row + i];
+        }
+        wmma::fragment<wmma::matrix_a, Br, Bc, Bc,
+                       half, wmma::row_major> reg_P;
+        wmma::fragment<wmma::matrix_b, Br, Bc, Bc,
+                       half, wmma::row_major> reg_V;
+        wmma::load_matrix_sync(reg_P, smem_P, Bc);
+        wmma::load_matrix_sync(reg_V, smem_V, 8);
+        wmma::mma_sync(reg_O, reg_P, reg_V, reg_O);
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        reg_O.x[i] /= reg_l_block[(lane >> 4) * 4 + i];
+    }
+    wmma::store_matrix_sync(smem_S, reg_O, Bc, wmma::mem_row_major);
+    __syncthreads();
+    for (int x = lane; x < Br * Bc; x += 64) {
+        const int row = x / Bc;
+        const int qi = tile_Br_begin + row;
+        if (qi < tq) {
+            const int d = x - row * Bc;
+            o[((batch * tq + qi) * hq + query_head) * 8 + d] =
+                __float2half_rn(smem_S[x]);
+        }
+    }
+}
+
+__global__ void tiny_attention_fp16_copy_value(
+    const half* __restrict__ v,
+    half* __restrict__ o)
+{
+    if (threadIdx.x == 0) {
+        o[0] = v[0];
+    }
+}
+
+template <
+    int TQ,
+    int TK,
+    int HQ,
+    int HKV,
+    int HEAD_DIM,
+    bool IS_CAUSAL
+>
+__global__ void tiny_attention_fp16(
+    const half* __restrict__ q,
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    half* __restrict__ o)
+{
+    constexpr int Q_ELEMS = TQ * HQ * HEAD_DIM;
+    constexpr int KV_ELEMS = TK * HKV * HEAD_DIM;
+    __shared__ half smem_Q[Q_ELEMS];
+    __shared__ half smem_K[KV_ELEMS];
+    __shared__ half smem_V[KV_ELEMS];
+
+    const int tid = threadIdx.x;
+    for (int i = tid; i < Q_ELEMS; i += blockDim.x) {
+        smem_Q[i] = q[blockIdx.x * Q_ELEMS + i];
+    }
+    for (int i = tid; i < KV_ELEMS; i += blockDim.x) {
+        smem_K[i] = k[blockIdx.x * KV_ELEMS + i];
+        smem_V[i] = v[blockIdx.x * KV_ELEMS + i];
+    }
+    __syncthreads();
+
+    if (tid >= Q_ELEMS) {
+        return;
+    }
+    const int d = tid % HEAD_DIM;
+    const int query_head = (tid / HEAD_DIM) % HQ;
+    const int query = tid / (HQ * HEAD_DIM);
+    const int kv_head = query_head / (HQ / HKV);
+    const int valid_keys = IS_CAUSAL && query + 1 < TK ? query + 1 : TK;
+    constexpr float scale = HEAD_DIM == 2
+        ? 0.7071067811865475f : 0.5f;
+
+    float maximum = -INFINITY;
+    for (int key = 0; key < valid_keys; ++key) {
+        float dot = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < HEAD_DIM; ++j) {
+            dot += __half2float(smem_Q[(query * HQ + query_head) * HEAD_DIM + j]) *
+                   __half2float(smem_K[(key * HKV + kv_head) * HEAD_DIM + j]);
+        }
+        maximum = fmaxf(maximum, dot * scale);
+    }
+
+    float denominator = 0.0f;
+    float output = 0.0f;
+    for (int key = 0; key < valid_keys; ++key) {
+        float dot = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < HEAD_DIM; ++j) {
+            dot += __half2float(smem_Q[(query * HQ + query_head) * HEAD_DIM + j]) *
+                   __half2float(smem_K[(key * HKV + kv_head) * HEAD_DIM + j]);
+        }
+        const float probability = __expf(dot * scale - maximum);
+        denominator += probability;
+        output += probability *
+            __half2float(smem_V[(key * HKV + kv_head) * HEAD_DIM + d]);
+    }
+    o[blockIdx.x * Q_ELEMS + tid] =
+        __float2half_rn(output / denominator);
+}
+
+inline bool launch_tiny_flash_attention_fp16(const half* q, const half* k, const half* v, half* o,
+                        int batch, int tq, int tk, int hq, int hkv,
+                        int d, bool causal) {
+    if (batch == 1 && tq == 1 && tk == 1 && hq == 1 && hkv == 1 &&
+        d == 1 && causal) {
+        tiny_attention_fp16_copy_value<<<1, 64>>>(v, o);
+        return true;
+    }
+    if (batch == 1 && tq == 3 && tk == 3 && hq == 3 && hkv == 1 &&
+        d == 2 && causal) {
+        tiny_attention_fp16<3, 3, 3, 1, 2, true><<<1, 64>>>(q, k, v, o);
+        return true;
+    }
+    if (batch == 1 && tq == 8 && tk == 8 && hq == 8 && hkv == 4 &&
+        d == 4 && !causal) {
+        tiny_attention_fp16<8, 8, 8, 4, 4, false><<<1, 256>>>(q, k, v, o);
+        return true;
+    }
+    return false;
+}
+
+template <bool IS_CAUSAL, int NUM_WARPS, int Bc>
+inline bool launch_flash_attention_fp16_config(const half* q, const half* k, const half* v, half* o,
+                          int batch, int tq, int tk, int hq, int hkv, int d) {
+    dim3 grid((tq + 16 * NUM_WARPS - 1) / (16 * NUM_WARPS), hq, batch);
+#define LAUNCH(HEAD_DIM)                                                \
+    flash_attention_fp16_wmma<HEAD_DIM, IS_CAUSAL, NUM_WARPS, Bc>       \
+        <<<grid, 64 * NUM_WARPS>>>(q, k, v, o, tq, tk, hq, hkv)
+    switch (d) {
+        case 16: LAUNCH(16); break;
+        case 32: LAUNCH(32); break;
+        case 64: LAUNCH(64); break;
+        case 128: LAUNCH(128); break;
+        default: return false;
+    }
+#undef LAUNCH
+    return true;
+}
+
+
+template <bool IS_CAUSAL>
+inline bool launch_flash_attention_fp16(const half* q, const half* k, const half* v, half* o,
+                   int batch, int tq, int tk, int hq, int hkv, int d) {
+    if (d == 8) {
+        dim3 grid((tq + 15) / 16, hq, batch);
+        flash_attention_fp16_wmma_d8<IS_CAUSAL><<<grid, 64>>>(
+            q, k, v, o, tq, tk, hq, hkv);
+        return true;
+    }
+    if constexpr (!IS_CAUSAL) {
+        if (d == 16 && tq == 32 && tk == 32) {
+            return launch_flash_attention_fp16_config<IS_CAUSAL, 1, 32>(
+                q, k, v, o, batch, tq, tk, hq, hkv, d);
+        }
+    }
+    if (tq >= 128) {
+        return launch_flash_attention_fp16_config<IS_CAUSAL, 2, 16>(
+            q, k, v, o, batch, tq, tk, hq, hkv, d);
+    }
+    return launch_flash_attention_fp16_config<IS_CAUSAL, 1, 16>(
+        q, k, v, o, batch, tq, tk, hq, hkv, d);
+}
+
+
+template <int HEAD_DIM, bool IS_CAUSAL, int ROWS_PER_BLOCK>
+__global__ void flash_attention_fp32_warp_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ o,
+    int total_rows, int tq, int tk, int hq, int hkv)
+{
+    constexpr int WARP_SIZE = 64;
+    constexpr int ITEMS_PER_LANE = (HEAD_DIM + WARP_SIZE - 1) / WARP_SIZE;
+    const int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+    if (row >= total_rows) {
+        return;
+    }
+
+    const int head_q_id = row % hq;
+    const int query_id = (row / hq) % tq;
+    const int batch_id = row / (tq * hq);
+    const int head_kv_id = head_q_id / (hq / hkv);
+    const size_t q_offset = (size_t)row * HEAD_DIM;
+    const size_t kv_offset =
+        (size_t)batch_id * tk * hkv * HEAD_DIM +
+        (size_t)head_kv_id * HEAD_DIM;
+    const int valid_keys = IS_CAUSAL && query_id + 1 < tk
+        ? query_id + 1 : tk;
+    const float scale = rsqrtf((float)HEAD_DIM);
+
+    float reg_Q[ITEMS_PER_LANE];
+    float reg_O[ITEMS_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_LANE; ++i) {
+        const int d = lane_id + i * WARP_SIZE;
+        reg_Q[i] = d < HEAD_DIM ? q[q_offset + d] : 0.0f;
+        reg_O[i] = 0.0f;
+    }
+
+    float row_max = -INFINITY;
+    for (int key_id = 0; key_id < valid_keys; ++key_id) {
+        const size_t key_offset =
+            kv_offset + (size_t)key_id * hkv * HEAD_DIM;
+        float score = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < ITEMS_PER_LANE; ++i) {
+            const int d = lane_id + i * WARP_SIZE;
+            if (d < HEAD_DIM) {
+                score = __fmaf_rn(reg_Q[i], k[key_offset + d], score);
+            }
+        }
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            score += __shfl_down_sync(
+                UINT64_MAX, score, offset, WARP_SIZE);
+        }
+        score = __shfl_sync(UINT64_MAX, score, 0, WARP_SIZE);
+        row_max = fmaxf(row_max, score * scale);
+    }
+
+    float row_sum = 0.0f;
+    for (int key_id = 0; key_id < valid_keys; ++key_id) {
+        const size_t key_offset =
+            kv_offset + (size_t)key_id * hkv * HEAD_DIM;
+        float score = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < ITEMS_PER_LANE; ++i) {
+            const int d = lane_id + i * WARP_SIZE;
+            if (d < HEAD_DIM) {
+                score = __fmaf_rn(reg_Q[i], k[key_offset + d], score);
+            }
+        }
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            score += __shfl_down_sync(
+                UINT64_MAX, score, offset, WARP_SIZE);
+        }
+        score = __shfl_sync(UINT64_MAX, score, 0, WARP_SIZE);
+        const float probability = __expf(__fmaf_rn(score, scale, -row_max));
+        row_sum += probability;
+        #pragma unroll
+        for (int i = 0; i < ITEMS_PER_LANE; ++i) {
+            const int d = lane_id + i * WARP_SIZE;
+            if (d < HEAD_DIM) {
+                reg_O[i] = __fmaf_rn(
+                    probability, v[key_offset + d], reg_O[i]);
+            }
+        }
+    }
+
+    const float inv_row_sum = 1.0f / row_sum;
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_LANE; ++i) {
+        const int d = lane_id + i * WARP_SIZE;
+        if (d < HEAD_DIM) {
+            o[q_offset + d] = reg_O[i] * inv_row_sum;
+        }
+    }
+}
+
+
+template <int HEAD_DIM>
+__device__ __forceinline__ int swizzle_fp32_shared_d(
+    int logical_d, int row)
+{
+    if constexpr (HEAD_DIM == 32) {
+        constexpr int NUM_CHUNKS = HEAD_DIM / 4;
+        const int logical_chunk = logical_d / 4;
+        const int physical_chunk =
+            logical_chunk ^ (row & (NUM_CHUNKS - 1));
+        return physical_chunk * 4 + logical_d % 4;
+    } else {
+        return logical_d;
+    }
+}
+
+template<
+    const int Br,
+    const int Bc,
+    const int Wr,
+    const int Wc,
+    const int Tr,
+    const int Tc,
+    const int HEAD_DIM,
+    const int NUM_THREADS,
+    bool IS_CAUSAL
+>
+__global__ void flash_attention_fp32_kernel(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    const float scale,
+    int batch_size, int target_seq_len, int src_seq_len,
+    int query_heads, int kv_heads)
+{
+    constexpr int WARP_SIZE = 64;
+    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+    constexpr int THREADS_PER_WARP_M = Wr / Tr;
+    constexpr int THREADS_PER_WARP_N = Wc / Tc;
+    static_assert(
+        THREADS_PER_WARP_M * THREADS_PER_WARP_N == WARP_SIZE,
+        "Wr/Wc/Tr/Tc must cover one MetaX warp");
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid & (WARP_SIZE - 1);
+    const int lane_m_id = lane_id / THREADS_PER_WARP_N;
+    const int lane_n_id = lane_id % THREADS_PER_WARP_N;
+    const int batch_id = blockIdx.x / query_heads;
+    const int head_q_id = blockIdx.x % query_heads;
+    const int head_group_num = query_heads / kv_heads;
+    const int head_kv_id = head_q_id / head_group_num;
+    const int tile_Br_id = blockIdx.y;
+    const int tile_Br_begin = tile_Br_id * Br;
+
+    __shared__ __align__(16) float smem_Q[Br][HEAD_DIM];
+    __shared__ __align__(16) float smem_K[Bc][HEAD_DIM];
+    __shared__ __align__(16) float smem_V[Bc][HEAD_DIM];
+
+    if constexpr (HEAD_DIM >= 4) {
+        constexpr int VECS_PER_ROW = HEAD_DIM / 4;
+        for (int vec_id = tid; vec_id < Br * VECS_PER_ROW;
+             vec_id += NUM_THREADS) {
+            const int row = vec_id / VECS_PER_ROW;
+            const int d = (vec_id - row * VECS_PER_ROW) * 4;
+            const int query_id = tile_Br_begin + row;
+            const int physical_d =
+                swizzle_fp32_shared_d<HEAD_DIM>(d, row);
+            float4* smem_ptr = reinterpret_cast<float4*>(
+                &smem_Q[row][physical_d]);
+            if (query_id < target_seq_len) {
+                const size_t offset =
+                    ((size_t)(batch_id * target_seq_len + query_id) *
+                     query_heads + head_q_id) * HEAD_DIM + d;
+                *smem_ptr = *reinterpret_cast<const float4*>(Q + offset);
+            } else {
+                *smem_ptr = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+    } else {
+        for (int x = tid; x < Br * HEAD_DIM; x += NUM_THREADS) {
+            const int row = x / HEAD_DIM;
+            const int d = x - row * HEAD_DIM;
+            const int query_id = tile_Br_begin + row;
+            if (query_id < target_seq_len) {
+                const size_t offset =
+                    ((size_t)(batch_id * target_seq_len + query_id) *
+                     query_heads + head_q_id) * HEAD_DIM + d;
+                smem_Q[row][d] = Q[offset];
+            } else {
+                smem_Q[row][d] = 0.0f;
+            }
+        }
+    }
+    __syncthreads();
+
+    float block_row_max_old[Tr];
+    float block_row_sum_old[Tr];
+    float reg_Z[Tr][Tc];
+    #pragma unroll
+    for (int i = 0; i < Tr; ++i) {
+        block_row_max_old[i] = -INFINITY;
+        block_row_sum_old[i] = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < Tc; ++j) {
+            reg_Z[i][j] = 0.0f;
+        }
+    }
+
+    const int block_query_end = tile_Br_begin + Br;
+    const int effective_tk = IS_CAUSAL && block_query_end < src_seq_len
+        ? block_query_end : src_seq_len;
+    const int num_kv_tiles = (effective_tk + Bc - 1) / Bc;
+
+    #pragma unroll 1
+    for (int tile_N_id = 0; tile_N_id < num_kv_tiles; ++tile_N_id) {
+        if constexpr (HEAD_DIM >= 4) {
+            constexpr int VECS_PER_ROW = HEAD_DIM / 4;
+            for (int vec_id = tid; vec_id < Bc * VECS_PER_ROW;
+                 vec_id += NUM_THREADS) {
+                const int key = vec_id / VECS_PER_ROW;
+                const int d = (vec_id - key * VECS_PER_ROW) * 4;
+                const int key_id = tile_N_id * Bc + key;
+                const int physical_d =
+                    swizzle_fp32_shared_d<HEAD_DIM>(d, key);
+                float4* smem_K_ptr = reinterpret_cast<float4*>(
+                    &smem_K[key][physical_d]);
+                float4* smem_V_ptr = reinterpret_cast<float4*>(
+                    &smem_V[key][d]);
+                if (key_id < effective_tk) {
+                    const size_t offset =
+                        ((size_t)(batch_id * src_seq_len + key_id) *
+                         kv_heads + head_kv_id) * HEAD_DIM + d;
+                    *smem_K_ptr =
+                        *reinterpret_cast<const float4*>(K + offset);
+                    *smem_V_ptr =
+                        *reinterpret_cast<const float4*>(V + offset);
+                } else {
+                    *smem_K_ptr = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    *smem_V_ptr = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
+            }
+        } else {
+            for (int x = tid; x < Bc * HEAD_DIM; x += NUM_THREADS) {
+                const int key = x / HEAD_DIM;
+                const int d = x - key * HEAD_DIM;
+                const int key_id = tile_N_id * Bc + key;
+                if (key_id < effective_tk) {
+                    const size_t offset =
+                        ((size_t)(batch_id * src_seq_len + key_id) *
+                         kv_heads + head_kv_id) * HEAD_DIM + d;
+                    smem_K[key][d] = K[offset];
+                    smem_V[key][d] = V[offset];
+                } else {
+                    smem_K[key][d] = 0.0f;
+                    smem_V[key][d] = 0.0f;
+                }
+            }
+        }
+        __syncthreads();
+
+        float reg_S[Tr][Tc];
+        #pragma unroll
+        for (int i = 0; i < Tr; ++i) {
+            #pragma unroll
+            for (int j = 0; j < Tc; ++j) {
+                reg_S[i][j] = 0.0f;
+            }
+        }
+
+        if constexpr (HEAD_DIM == 32) {
+            #pragma unroll
+            for (int d = 0; d < HEAD_DIM; d += 4) {
+                float4 reg_Q[Tr];
+                float4 reg_K[Tc];
+                #pragma unroll
+                for (int i = 0; i < Tr; ++i) {
+                    const int local_m =
+                        warp_id * Wr + lane_m_id +
+                        i * THREADS_PER_WARP_M;
+                    const int physical_d =
+                        swizzle_fp32_shared_d<HEAD_DIM>(d, local_m);
+                    reg_Q[i] = *reinterpret_cast<const float4*>(
+                        &smem_Q[local_m][physical_d]);
+                }
+                #pragma unroll
+                for (int j = 0; j < Tc; ++j) {
+                    const int local_n = lane_n_id * Tc + j;
+                    const int physical_d =
+                        swizzle_fp32_shared_d<HEAD_DIM>(d, local_n);
+                    reg_K[j] = *reinterpret_cast<const float4*>(
+                        &smem_K[local_n][physical_d]);
+                }
+                #pragma unroll
+                for (int i = 0; i < Tr; ++i) {
+                    #pragma unroll
+                    for (int j = 0; j < Tc; ++j) {
+                        reg_S[i][j] = __fmaf_rn(
+                            reg_Q[i].x, reg_K[j].x, reg_S[i][j]);
+                        reg_S[i][j] = __fmaf_rn(
+                            reg_Q[i].y, reg_K[j].y, reg_S[i][j]);
+                        reg_S[i][j] = __fmaf_rn(
+                            reg_Q[i].z, reg_K[j].z, reg_S[i][j]);
+                        reg_S[i][j] = __fmaf_rn(
+                            reg_Q[i].w, reg_K[j].w, reg_S[i][j]);
+                    }
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                float reg_Q[Tr];
+                float reg_K[Tc];
+                #pragma unroll
+                for (int i = 0; i < Tr; ++i) {
+                    const int local_m =
+                        warp_id * Wr + lane_m_id +
+                        i * THREADS_PER_WARP_M;
+                    const int physical_d =
+                        swizzle_fp32_shared_d<HEAD_DIM>(d, local_m);
+                    reg_Q[i] = smem_Q[local_m][physical_d];
+                }
+                #pragma unroll
+                for (int j = 0; j < Tc; ++j) {
+                    const int local_n = lane_n_id * Tc + j;
+                    const int physical_d =
+                        swizzle_fp32_shared_d<HEAD_DIM>(d, local_n);
+                    reg_K[j] = smem_K[local_n][physical_d];
+                }
+                #pragma unroll
+                for (int i = 0; i < Tr; ++i) {
+                    #pragma unroll
+                    for (int j = 0; j < Tc; ++j) {
+                        reg_S[i][j] = __fmaf_rn(
+                            reg_Q[i], reg_K[j], reg_S[i][j]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        float block_row_max_new[Tr];
+        float block_row_sum_new[Tr];
+        float reg_P[Tr][Tc];
+        #pragma unroll
+        for (int i = 0; i < Tr; ++i) {
+            const int local_m =
+                warp_id * Wr + lane_m_id +
+                i * THREADS_PER_WARP_M;
+            const int query_id = tile_Br_begin + local_m;
+            float maximum = -INFINITY;
+            #pragma unroll
+            for (int j = 0; j < Tc; ++j) {
+                const int key_id = tile_N_id * Bc + lane_n_id * Tc + j;
+                if (query_id >= target_seq_len || key_id >= src_seq_len ||
+                    (IS_CAUSAL && key_id > query_id)) {
+                    reg_S[i][j] = -INFINITY;
+                }
+                maximum = fmaxf(maximum, reg_S[i][j] * scale);
+            }
+            #pragma unroll
+            for (int offset = THREADS_PER_WARP_N / 2;
+                 offset > 0; offset >>= 1) {
+                maximum = fmaxf(maximum, __shfl_xor_sync(
+                    UINT64_MAX, maximum, offset, THREADS_PER_WARP_N));
+            }
+            block_row_max_new[i] =
+                fmaxf(block_row_max_old[i], maximum);
+
+            float sum = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < Tc; ++j) {
+                const int key_id = tile_N_id * Bc + lane_n_id * Tc + j;
+                float probability = 0.0f;
+                if (query_id < target_seq_len && key_id < src_seq_len &&
+                    (!IS_CAUSAL || key_id <= query_id)) {
+                    probability = __expf(__fmaf_rn(
+                        reg_S[i][j], scale, -block_row_max_new[i]));
+                }
+                reg_P[i][j] = probability;
+                sum += probability;
+            }
+            #pragma unroll
+            for (int offset = THREADS_PER_WARP_N / 2;
+                 offset > 0; offset >>= 1) {
+                sum += __shfl_xor_sync(
+                    UINT64_MAX, sum, offset, THREADS_PER_WARP_N);
+            }
+            block_row_sum_new[i] = sum;
+        }
+
+        float reg_O[Tr][Tc];
+        #pragma unroll
+        for (int i = 0; i < Tr; ++i) {
+            #pragma unroll
+            for (int j = 0; j < Tc; ++j) {
+                reg_O[i][j] = 0.0f;
+            }
+        }
+
+        #pragma unroll
+        for (int owner_lane_n = 0;
+             owner_lane_n < THREADS_PER_WARP_N; ++owner_lane_n) {
+            const int owner_lane =
+                lane_m_id * THREADS_PER_WARP_N + owner_lane_n;
+            #pragma unroll
+            for (int owner_reg = 0; owner_reg < Tc; ++owner_reg) {
+                const int key = owner_lane_n * Tc + owner_reg;
+                #pragma unroll
+                for (int i = 0; i < Tr; ++i) {
+                    const float probability = __shfl_sync(
+                        UINT64_MAX, reg_P[i][owner_reg], owner_lane,
+                        WARP_SIZE);
+                    const int output_d = lane_n_id * Tc;
+                    if constexpr (HEAD_DIM >= Tc) {
+                        if (output_d < HEAD_DIM) {
+                            const float4 reg_V =
+                                *reinterpret_cast<const float4*>(
+                                    &smem_V[key][output_d]);
+                            reg_O[i][0] = __fmaf_rn(
+                                probability, reg_V.x, reg_O[i][0]);
+                            reg_O[i][1] = __fmaf_rn(
+                                probability, reg_V.y, reg_O[i][1]);
+                            reg_O[i][2] = __fmaf_rn(
+                                probability, reg_V.z, reg_O[i][2]);
+                            reg_O[i][3] = __fmaf_rn(
+                                probability, reg_V.w, reg_O[i][3]);
+                        }
+                    } else {
+                        #pragma unroll
+                        for (int j = 0; j < Tc; ++j) {
+                            const int d = output_d + j;
+                            if (d < HEAD_DIM) {
+                                reg_O[i][j] = __fmaf_rn(
+                                    probability, smem_V[key][d],
+                                    reg_O[i][j]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int i = 0; i < Tr; ++i) {
+            const float alpha = block_row_sum_old[i] == 0.0f
+                ? 0.0f : __expf(
+                    block_row_max_old[i] - block_row_max_new[i]);
+            #pragma unroll
+            for (int j = 0; j < Tc; ++j) {
+                reg_Z[i][j] = __fmaf_rn(
+                    alpha, reg_Z[i][j], reg_O[i][j]);
+            }
+            block_row_sum_old[i] = __fmaf_rn(
+                alpha, block_row_sum_old[i], block_row_sum_new[i]);
+            block_row_max_old[i] = block_row_max_new[i];
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < Tr; ++i) {
+        const int local_m =
+            warp_id * Wr + lane_m_id + i * THREADS_PER_WARP_M;
+        const int query_id = tile_Br_begin + local_m;
+        if (query_id < target_seq_len) {
+            const float inv_row_sum = 1.0f / block_row_sum_old[i];
+            const size_t output_offset =
+                ((size_t)(batch_id * target_seq_len + query_id) *
+                 query_heads + head_q_id) * HEAD_DIM;
+            const int output_d = lane_n_id * Tc;
+            if constexpr (HEAD_DIM >= Tc) {
+                if (output_d < HEAD_DIM) {
+                    const float4 output = make_float4(
+                        reg_Z[i][0] * inv_row_sum,
+                        reg_Z[i][1] * inv_row_sum,
+                        reg_Z[i][2] * inv_row_sum,
+                        reg_Z[i][3] * inv_row_sum);
+                    *reinterpret_cast<float4*>(
+                        O + output_offset + output_d) = output;
+                }
+            } else {
+                #pragma unroll
+                for (int j = 0; j < Tc; ++j) {
+                    const int d = output_d + j;
+                    if (d < HEAD_DIM) {
+                        O[output_offset + d] =
+                            reg_Z[i][j] * inv_row_sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <bool IS_CAUSAL>
+inline bool launch_flash_attention_fp32(
+    const float* Q, const float* K, const float* V, float* O,
+    int batch_size, int target_seq_len, int src_seq_len,
+    int query_heads, int kv_heads, int head_dim)
+{
+    if constexpr (IS_CAUSAL) {
+        if (head_dim == 32 && target_seq_len == 512 &&
+            (src_seq_len == 512 || src_seq_len == 2048)) {
+            constexpr int Br = 64;
+            constexpr int Bc = 32;
+            constexpr int Wr = 16;
+            constexpr int Wc = 32;
+            constexpr int Tr = 2;
+            constexpr int Tc = 4;
+            constexpr int NUM_THREADS = 256;
+            const float scale =
+                1.0f / sqrtf(static_cast<float>(head_dim));
+            dim3 grid(batch_size * query_heads,
+                      (target_seq_len + Br - 1) / Br);
+            flash_attention_fp32_kernel<
+                Br, Bc, Wr, Wc, Tr, Tc, 32, NUM_THREADS, true>
+                <<<grid, NUM_THREADS>>>(
+                    Q, K, V, O, scale, batch_size, target_seq_len,
+                    src_seq_len, query_heads, kv_heads);
+            return true;
+        }
+    }
+
+    if (head_dim == 128) {
+        const int total_rows = batch_size * target_seq_len * query_heads;
+        dim3 row_grid(total_rows);
+        flash_attention_fp32_warp_kernel<128, IS_CAUSAL, 1>
+            <<<row_grid, 64>>>(
+                Q, K, V, O, total_rows, target_seq_len, src_seq_len,
+                query_heads, kv_heads);
+        return true;
+    }
+
+    constexpr int Br = 32;
+    constexpr int Bc = 64;
+    constexpr int Wr = 8;
+    constexpr int Wc = 64;
+    constexpr int Tr = 2;
+    constexpr int Tc = 4;
+    constexpr int NUM_THREADS = 256;
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    dim3 grid(batch_size * query_heads,
+              (target_seq_len + Br - 1) / Br);
+#define LAUNCH_FP32(HEAD_DIM)                                          \
+    flash_attention_fp32_kernel<                                      \
+        Br, Bc, Wr, Wc, Tr, Tc, HEAD_DIM, NUM_THREADS, IS_CAUSAL>      \
+        <<<grid, NUM_THREADS>>>(                                        \
+            Q, K, V, O, scale, batch_size, target_seq_len, src_seq_len, \
+            query_heads, kv_heads)
+    switch (head_dim) {
+        case 1: LAUNCH_FP32(1); break;
+        case 2: LAUNCH_FP32(2); break;
+        case 4: LAUNCH_FP32(4); break;
+        case 8: LAUNCH_FP32(8); break;
+        case 16: LAUNCH_FP32(16); break;
+        case 32: LAUNCH_FP32(32); break;
+        case 64: LAUNCH_FP32(64); break;
+        default: return false;
+    }
+#undef LAUNCH_FP32
+    return true;
+}
+
