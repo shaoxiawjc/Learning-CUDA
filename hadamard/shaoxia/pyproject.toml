@@ -1,0 +1,27 @@
+[project]
+name = "hadamard-bench"
+version = "0.1.0"
+description = "Benchmark our CUDA Hadamard kernel vs fast-hadamard-transform"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "fast-hadamard-transform",
+]
+
+# fast-hadamard-transform is vendored in third-party/ (built from source).
+[tool.uv.sources]
+fast-hadamard-transform = { path = "third-party/fast-hadamard-transform" }
+
+# Its setup.py does `import torch` but never declares torch as a build
+# dependency, so uv's isolated build env lacks it. Provide it here.
+[tool.uv.extra-build-dependencies]
+fast-hadamard-transform = ["torch"]
+
+# To pin the exact CUDA variant on a new machine, add e.g.:
+#   [[tool.uv.index]]
+#   name = "pytorch-cu130"
+#   url = "https://download.pytorch.org/whl/cu130"
+#   explicit = true
+#   [tool.uv.sources]
+#   torch = { index = "pytorch-cu130" }
+# and pin "torch==2.13.0+cu130" in dependencies.
