@@ -12,6 +12,7 @@ benchmark_comparison_*.png
 profile_kernels.o
 profile_rms_norm
 *.nsys-rep
+*.ncu-rep
 
 # IDE
 .idea/
@@ -23,3 +24,8 @@ profile_rms_norm
 ncu_profile/
 
 hadamard/shaoxia/third-party
+
+# hadamard/shaoxia: build artifacts and generated output
+hadamard/shaoxia/build/
+hadamard/shaoxia/hadamard_bench.egg-info/
+hadamard/shaoxia/bench_results.json

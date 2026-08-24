@@ -12,10 +12,13 @@ dependencies = [
 [tool.uv.sources]
 fast-hadamard-transform = { path = "third-party/fast-hadamard-transform" }
 
-# Its setup.py does `import torch` but never declares torch as a build
-# dependency, so uv's isolated build env lacks it. Provide it here.
-[tool.uv.extra-build-dependencies]
-fast-hadamard-transform = ["torch"]
+# Its setup.py does `import torch` at build time (it compiles a CUDA extension
+# via torch.utils.cpp_extension) but never declares torch as a build
+# dependency, so uv's isolated build env lacks it and the build fails.
+# Build it without isolation so it uses the torch already in the venv,
+# which also keeps the extension matching that exact CUDA/torch variant.
+[tool.uv]
+no-build-isolation-package = ["fast-hadamard-transform"]
 
 # To pin the exact CUDA variant on a new machine, add e.g.:
 #   [[tool.uv.index]]
