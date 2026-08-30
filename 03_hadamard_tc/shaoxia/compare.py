@@ -12,10 +12,14 @@ METRICS = {
     "speedup": "speedup",
     "ours_ms": "ours_ms",
     "fht_ms": "fht_ms",
+    "hada_ms": "hada_ms",
     "ours_gflops": "ours_gflops",
     "fht_gflops": "fht_gflops",
+    "hada_gflops": "hada_gflops",
     "ours_gbps": "ours_gbps",
     "fht_gbps": "fht_gbps",
+    "hada_gbps": "hada_gbps",
+    "speedup_hada": "speedup_hada",
 }
 
 DTYPES = {"fp16": "float16", "bf16": "bfloat16", "all": None}
@@ -28,7 +32,9 @@ def parse_ints(spec):
 
 
 def fmt(v, metric):
-    if metric == "speedup":
+    if v is None:
+        return "-" * 9
+    if metric.startswith("speedup"):
         return f"{v:8.2f}x"
     if metric.endswith("ms"):
         return f"{v:9.3f}"

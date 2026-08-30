@@ -76,6 +76,63 @@ ext = load_inline(
 
 OURS = {torch.float16: ext.hadamard_fp16, torch.bfloat16: ext.hadamard_bf16}
 
+# ---- build hadacore (tensor-core) kernel extension
+HADACORE_CPP_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cstdint>
+
+template <torch::ScalarType dtype>
+void run_fht(void* a_mat_ptr, void* out_ptr, uint32_t numel, uint32_t had_size,
+             cudaStream_t stream);
+
+void hadacore_fp16(torch::Tensor x, torch::Tensor out) {
+    run_fht<torch::ScalarType::Half>(
+        x.data_ptr(), out.data_ptr(),
+        static_cast<uint32_t>(x.numel()), static_cast<uint32_t>(x.size(1)),
+        at::cuda::getCurrentCUDAStream().stream());
+}
+void hadacore_bf16(torch::Tensor x, torch::Tensor out) {
+    run_fht<torch::ScalarType::BFloat16>(
+        x.data_ptr(), out.data_ptr(),
+        static_cast<uint32_t>(x.numel()), static_cast<uint32_t>(x.size(1)),
+        at::cuda::getCurrentCUDAStream().stream());
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("hadacore_fp16", &hadacore_fp16);
+    m.def("hadacore_bf16", &hadacore_bf16);
+}
+"""
+
+hada_ext = load_inline(
+    name="hada_core",
+    cpp_sources=HADACORE_CPP_SRC,
+    cuda_sources=open("hadacore.cu").read(),
+    extra_cuda_cflags=["-O3"],
+    verbose=False,
+)
+
+HADACORE = {torch.float16: hada_ext.hadacore_fp16, torch.bfloat16: hada_ext.hadacore_bf16}
+
+
+def hadacore_supported(rows, cols):
+    """hadacore's run_fht needs numel (rows*cols) divisible by 256 and a
+    power-of-two transform size in [2, 32768] (kernels are instantiated for
+    log sizes 1..15 only)."""
+    return (rows * cols) % 256 == 0 and 2 <= cols <= 32768 and (cols & (cols - 1)) == 0
+
+
+def hadacore_tol(dtype, cols):
+    """Error tolerance for hadacore vs fht/ref.
+
+    hadacore accumulates fp16 in fp16 via tensor-core mma (bf16 in fp32), so it
+    rounds differently from fht's fp32 accumulation: the two are both correct to
+    within ~1 ulp of the output magnitude (~sqrt(cols) for standard-normal
+    input), but not bit-identical. Allow ~8 ulps so genuine bugs (wrong ordering,
+    scaling, ...) still trip the check while legitimate rounding does not."""
+    eps = 2 ** -10 if dtype == torch.float16 else 2 ** -7  # fp16 / bf16 epsilon
+    return 8 * eps * math.sqrt(cols)
+
 
 def make_sylvester(n):
     """H_n with H[m][k] = (-1)^popcount(m & k), i.e. y = x @ H."""
@@ -102,20 +159,36 @@ def check_correctness(dtype, rows, cols, H):
 
     theirs = fht.hadamard_transform(x)
 
+    run_hada = hadacore_supported(rows, cols)
+    hada = torch.empty_like(x)
+    if run_hada:
+        HADACORE[dtype](x, hada)
+
     def err(y):
         return (y.float() - ref).abs().max().item()
 
-    err_vs_fht = (ours.float() - theirs.float()).abs().max().item()
     tol = MAX_ERR_VS_FHT[dtype]
-    ok = "PASS" if err_vs_fht <= tol else "FAIL"
 
     print(f"  dtype={str(dtype)[6:]}, rows={rows}, cols={cols}")
     print(f"    max|ours  - ref| = {err(ours):.4e}")
     print(f"    max|fht   - ref| = {err(theirs):.4e}")
-    print(f"    max|ours  - fht| = {err_vs_fht:.4e}  (requirement <= {tol:.0e}) [{ok}]")
-    assert err_vs_fht <= tol, (
-        f"{dtype}: max|ours - fht| = {err_vs_fht:.4e} exceeds requirement {tol:.0e}"
+    if run_hada:
+        print(f"    max|hada  - ref| = {err(hada):.4e}")
+
+    err_ours_fht = (ours.float() - theirs.float()).abs().max().item()
+    ok = "PASS" if err_ours_fht <= tol else "FAIL"
+    print(f"    max|ours  - fht| = {err_ours_fht:.4e}  (requirement <= {tol:.0e}) [{ok}]")
+    assert err_ours_fht <= tol, (
+        f"{dtype}: max|ours - fht| = {err_ours_fht:.4e} exceeds requirement {tol:.0e}"
     )
+
+    if run_hada:
+        err_hada_fht = (hada.float() - theirs.float()).abs().max().item()
+        ok_hada = "PASS" if err_hada_fht <= tol else "FAIL"
+        print(f"    max|hada  - fht| = {err_hada_fht:.4e}  (requirement <= {tol:.0e}) [{ok_hada}]")
+        assert err_hada_fht <= tol, (
+            f"{dtype}: max|hadacore - fht| = {err_hada_fht:.4e} exceeds requirement {tol:.0e}"
+        )
 
 
 def time_fn(fn, iters=100, warmup_ms=200.0):
@@ -172,26 +245,37 @@ def bench(dtype, rows, cols):
     # Raw CUDA entry: skip fht's autograd.Function + Python wrapper overhead so we
     # time the kernel, not the call glue. scale=1.0 matches the default.
     theirs = time_fn(lambda: fht_cuda.fast_hadamard_transform(x, 1.0))
+    run_hada = hadacore_supported(rows, cols)
+    hada = time_fn(lambda: HADACORE[dtype](x, out)) if run_hada else None
+
     bytes_moved = 2 * rows * cols * x.element_size()  # read + write
     flops = rows * cols * int(math.log2(cols))        # FWHT: N log2(N) per row
     gbps = lambda ms: bytes_moved / (ms * 1e-3) / 1e9
     gflops = lambda ms: flops / (ms * 1e-3) / 1e9
     speedup = theirs / ours
+    speedup_hada = theirs / hada if run_hada else None
+
+    hada_part = (f" | hada {hada:8.3f} ms ({gflops(hada):7.1f} GFLOP/s) | "
+                 f"hada/fht {speedup_hada:6.2f}x") if run_hada else " | hada  n/a"
     print(f"  dtype={str(dtype)[6:]}, rows={rows:>6}, cols={cols:>5} | "
           f"ours {ours:8.3f} ms ({gflops(ours):7.1f} GFLOP/s) | "
           f"fht  {theirs:8.3f} ms ({gflops(theirs):7.1f} GFLOP/s) | "
-          f"speedup {speedup:6.2f}x")
+          f"speedup {speedup:6.2f}x{hada_part}")
     return {
         "dtype": str(dtype)[6:],
         "rows": rows,
         "cols": cols,
         "ours_ms": ours,
         "fht_ms": theirs,
+        "hada_ms": hada,
         "ours_gbps": gbps(ours),
         "fht_gbps": gbps(theirs),
+        "hada_gbps": gbps(hada) if run_hada else None,
         "ours_gflops": gflops(ours),
         "fht_gflops": gflops(theirs),
+        "hada_gflops": gflops(hada) if run_hada else None,
         "speedup": speedup,
+        "speedup_hada": speedup_hada,
     }
 
 
