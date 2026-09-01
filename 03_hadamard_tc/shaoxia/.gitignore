@@ -1,18 +1,6 @@
-# vendored third-party dependency (pulled by scripts/vendor-fht.sh)
-third-party/
-
-# uv
-.venv/
-uv.lock.bak
-
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-
-# build / tooling output
+# build artifacts
+bench
+*.o
+*.so
 build/
 dist/
-*.so
-*.o

@@ -1,28 +1,42 @@
 #!/usr/bin/env bash
+# Profile a single (rows, cols) Hadamard kernel launch with Nsight Compute (ncu).
+#
+# Usage:
+#   bash prof.sh                          # defaults: impl 2, fp16, 2048 x 8192
+#   bash prof.sh 3 2048 16384 bf16        # positional: IMPL ROWS DIMS [DTYPE]
+#   ROWS=1024 DIMS=4096 bash prof.sh      # env overrides work too
+#
+# For the tensor-core kernel (impl tc), the kernel name differs:
+#   IMPL=tc KERNEL=hadamard_tc_kernel bash prof.sh 2048 8192
 set -euo pipefail
 
-# Which implementation to compile/profile: `bash prof.sh 3` (or IMPL=3 bash prof.sh).
+cd "$(dirname "$0")"
+
 IMPL="${1:-${IMPL:-2}}"
+ROWS="${2:-${ROWS:-2048}}"
+DIMS="${3:-${DIMS:-8192}}"
+DTYPE="${4:-${DTYPE:-fp16}}"
 
-# Put the venv's tools (ninja) on PATH so load_inline can (re)build if needed.
-export PATH="$PWD/.venv/bin:$PATH"
+# ncu --kernel-name regex. 'hadamard_kernel' matches impl 1/2/3/4 (scalar/small/
+# vec/multi_warp[_chunked]) but not the fht ('fast_hadamard_transform_kernel') or
+# hadacore ('hadamard_transform_kernel') baselines. For tc use 'hadamard_tc_kernel'.
+KERNEL="${KERNEL:-hadamard_kernel}"
+SET="${SET:-full}"                              # basic|detailed|full|...
+OUT="${OUT:-prof_${IMPL}_${DTYPE}_${ROWS}x${DIMS}}"
+NCU_ARGS="${NCU_ARGS:-}"
 
-# Resolve values load_inline needs *before* sudo strips the environment:
-#   - CUDA_HOME: torch resolves it to /opt/cuda but never exports it; load_inline
-#     reads the env var directly and raises "CUDA_HOME is not set" if it must rebuild.
-#   - TORCH_EXTENSIONS_DIR: pin it to *your* cache so the root process reuses the
-#     already-built extension instead of rebuilding into /root/.cache.
-export CUDA_HOME="${CUDA_HOME:-$(.venv/bin/python -c 'from torch.utils.cpp_extension import CUDA_HOME as h; print(h)' 2>/dev/null)}"
-export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$HOME/.cache/torch_extensions}"
+make bench
 
-# 1) Build/refresh the extension as you (cache stays owned by you, no sudo). The
-#    impl must match what prof.py will run, else it rebuilds (as root) under sudo.
-.venv/bin/python -c "import sys; sys.argv=['bench.py','--impl','$IMPL']; import bench"
+# --no-check skips the fp32 reference pass; --no-warmup skips the 1s global warmup;
+# --iters 1 --warmup-ms 0 keep the launch count tiny. --kernel-name + --launch-count 1
+# then profile only the first matching kernel launch.
+ncu \
+  --kernel-name "$KERNEL" \
+  --launch-count 1 \
+  --set "$SET" \
+  -o "$OUT" \
+  $NCU_ARGS \
+  ./bench --impl "$IMPL" --rows "$ROWS" --dims "$DIMS" --dtype "$DTYPE" \
+          --no-check --no-warmup --iters 1 --warmup-ms 0
 
-# 2) Profile under ncu. `sudo env` re-exports the vars sudo would otherwise strip
-#    (PATH, CUDA_HOME, TORCH_EXTENSIONS_DIR). Drop `sudo` if ncu works without it
-#    (preferred); re-add only on ERR_NVGPUCTRPERM.
-sudo env PATH="$PATH" CUDA_HOME="$CUDA_HOME" TORCH_EXTENSIONS_DIR="$TORCH_EXTENSIONS_DIR" \
-    ncu --kernel-name regex:hadamard_kernel -c 1 --launch-skip 9 \
-        --set full -o report -f \
-        .venv/bin/python prof.py --impl "$IMPL" --dtype fp16 --rows 2048 --cols 8192 --iters 10
+echo "report: ${OUT}.ncu-rep"

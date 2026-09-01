@@ -608,6 +608,22 @@ void hadamard_v3(const T *input, T *output, int rows, int cols,
             hadamard_kernel_multi_warp_per_row<T, 8192, WARPS_PER_ROW><<<grid, block, 0, stream>>>(input, output, rows);
             break;
         }
+        case 16384: {
+            constexpr int WARPS_PER_ROW = 8;
+            constexpr int THREADS_PER_BLOCK = WARPS_PER_ROW * WARP_SIZE;
+            dim3 block(THREADS_PER_BLOCK);
+            dim3 grid(rows);
+            hadamard_kernel_multi_warp_per_row_chunked<T, 16384, WARPS_PER_ROW><<<grid, block, 0, stream>>>(input, output, rows);
+            break;
+        }
+        case 32768: {
+            constexpr int WARPS_PER_ROW = 16;
+            constexpr int THREADS_PER_BLOCK = WARPS_PER_ROW * WARP_SIZE;
+            dim3 block(THREADS_PER_BLOCK);
+            dim3 grid(rows);
+            hadamard_kernel_multi_warp_per_row_chunked<T, 32768, WARPS_PER_ROW><<<grid, block, 0, stream>>>(input, output, rows);
+            break;
+        }
         default:
             assert(false && "cols no");
         }
@@ -758,10 +774,10 @@ void hadamard(const T *input, T *output, int rows, int cols,
     hadamard_v1<T>(input, output, rows, cols, stream);
 #elif HADAMARD_IMPL == 2
     hadamard_v2<T>(input, output, rows, cols, stream);
-#elif HADAMARD_IMPL == 3
-    hadamard_v3<T>(input, output, rows, cols, stream);
-#elif HADAMARD_IMPL == 4
-    hadamard_v4<T>(input, output, rows, cols, stream);
+// #elif HADAMARD_IMPL == 3
+//     hadamard_v3<T>(input, output, rows, cols, stream);
+// #elif HADAMARD_IMPL == 4
+//     hadamard_v4<T>(input, output, rows, cols, stream);
 #else
 #error "HADAMARD_IMPL must be 1 (scalar), 2 (vec), 3 (multi-warp), or 4 (auto)"
 #endif
@@ -769,3 +785,14 @@ void hadamard(const T *input, T *output, int rows, int cols,
 
 template void hadamard<__half>(const __half*, __half*, int, int, cudaStream_t);
 template void hadamard<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);
+
+// Explicit instantiations of each implementation so the host can select the
+// impl at runtime (instead of pinning it at compile time via HADAMARD_IMPL).
+template void hadamard_v1<__half>(const __half*, __half*, int, int, cudaStream_t);
+template void hadamard_v1<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);
+template void hadamard_v2<__half>(const __half*, __half*, int, int, cudaStream_t);
+template void hadamard_v2<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);
+// template void hadamard_v3<__half>(const __half*, __half*, int, int, cudaStream_t);
+// template void hadamard_v3<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);
+// template void hadamard_v4<__half>(const __half*, __half*, int, int, cudaStream_t);
+// template void hadamard_v4<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);

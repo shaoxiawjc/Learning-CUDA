@@ -1,12 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
 
-for VERSION in 3; do
-    python bench.py \
-        --rows 1024,2048,4096 \
-        --dims 1024,2048,4096,8192 \
-        --impl ${VERSION} \
-        --name v${VERSION}
+cd "$(dirname "$0")"
+
+make bench
+
+ROWS=2048
+DIMS=1024,2048,4096,8192
+
+for IMPL in 2; do
+    ./bench --impl "$IMPL" --rows "$ROWS" --dims "$DIMS"
 done
 
-python compare.py --runs v1,v2,v3 --dtype all \
-    --rows 1024,2048,4096 \
-    --dims 1024,2048,4096,8192
+# ./bench --impl tc --rows "$ROWS" --dims "$DIMS"
