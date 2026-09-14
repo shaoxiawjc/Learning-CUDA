@@ -10,7 +10,7 @@
 typedef uint32_t b32;
 
 // Build the H16 matrix as an mma A-fragment for this lane (mirrors the same
-// helper in hadamard_tensor_core.cu).
+// Build the constant fragment directly so the hybrid kernel is self-contained.
 template <typename T>
 __device__ __forceinline__ void make_h16_a_frag(b32 (&frag)[4], int lane_id)
 {

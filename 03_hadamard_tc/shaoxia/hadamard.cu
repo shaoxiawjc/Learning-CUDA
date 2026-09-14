@@ -18,6 +18,7 @@ struct alignas(16) BFloat16_8 {
     __nv_bfloat16 x[8];
 };
 
+
 static_assert(sizeof(Half8) == 16);
 static_assert(sizeof(BFloat16_8) == 16);
 
@@ -71,7 +72,6 @@ void store_float8_as_8(
 
     *reinterpret_cast<uint4*>(ptr) = packed;
 }
-
 
 __device__ __forceinline__
 void store_float8_as_8(
@@ -509,6 +509,21 @@ void hadamard_v1(const T *input, T *output, int rows, int cols,
     dim3 grid((rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
 
     switch (cols) {
+        case 32:
+            hadamard_kernel_scalar<T, 32, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+            break;
+        case 64:
+            hadamard_kernel_scalar<T, 64, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+            break;
+        case 128:
+            hadamard_kernel_scalar<T, 128, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+            break;
+        case 256:
+            hadamard_kernel_scalar<T, 256, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+            break;
+        case 512:
+            hadamard_kernel_scalar<T, 512, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+            break;
         case 1024:
             hadamard_kernel_scalar<T, 1024, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
             break;
@@ -547,6 +562,12 @@ void hadamard_v2(const T *input, T *output, int rows, int cols,
 
     switch (cols)
     {
+    case 256:
+        hadamard_kernel_vec<T, 256, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+        break;
+    case 512:
+        hadamard_kernel_vec<T, 512, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+        break;
     case 1024:
         hadamard_kernel_vec<T, 1024, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
         break;
@@ -644,13 +665,11 @@ void hadamard_v4(const T *input, T *output, int rows, int cols,
     }
     assert((1 << log2_n) == cols && "cols must be a power of 2");
 
-    // cols alone picks the kernel (it sets register pressure and whether a whole
-    // row fits in shared memory); rows only sizes the grid:
+    // Select by cols and, for the middle sizes, by row count:
     //   2/4/8/16    -> one thread per row (row fits in one thread's registers)
     //   32/64/128   -> scalar warp-shuffle (one warp per row)
-    //   256..2048   -> vectorized 8-wide (one warp per row)
-    //   4096/8192   -> multi-warp-per-row (whole row still fits in smem)
-    //   >= 16384    -> multi-warp-per-row, smem capped at 32 KB, exchanged in rounds
+    //   256..8192   -> multi-warp-per-row for rows <= 64, otherwise vec
+    //   16384/32768 -> chunked multi-warp-per-row
     if (cols < WARP_SIZE) {
         constexpr int THREADS_PER_BLOCK = 256;
         // One warp handles WARP_SIZE / cols rows, so a block handles
@@ -693,43 +712,69 @@ void hadamard_v4(const T *input, T *output, int rows, int cols,
         default:
             assert(false && "cols no");
         }
-    } else if (cols <= 2048) {
-        constexpr int ROWS_PER_BLOCK = 4;
-        constexpr int THREADS_PER_BLOCK = ROWS_PER_BLOCK * WARP_SIZE;
-        dim3 block(THREADS_PER_BLOCK);
-        dim3 grid((rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
-        switch (cols)
-        {
-        case 256:
-            hadamard_kernel_vec<T, 256, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
-            break;
-        case 512:
-            hadamard_kernel_vec<T, 512, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
-            break;
-        case 1024:
-            hadamard_kernel_vec<T, 1024, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
-            break;
-        case 2048:
-            hadamard_kernel_vec<T, 2048, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
-            break;
-        default:
-            assert(false && "cols no");
-        }
     } else if (cols <= 8192) {
-        constexpr int WARPS_PER_ROW = 4;
-        constexpr int THREADS_PER_BLOCK = WARPS_PER_ROW * WARP_SIZE;
-        dim3 block(THREADS_PER_BLOCK);
-        dim3 grid(rows);
-        switch (cols)
-        {
-        case 4096:
-            hadamard_kernel_multi_warp_per_row<T, 4096, WARPS_PER_ROW><<<grid, block, 0, stream>>>(input, output, rows);
-            break;
-        case 8192:
-            hadamard_kernel_multi_warp_per_row<T, 8192, WARPS_PER_ROW><<<grid, block, 0, stream>>>(input, output, rows);
-            break;
-        default:
-            assert(false && "cols no");
+        if (rows <= 64) {
+            dim3 grid(rows);
+            switch (cols)
+            {
+            case 256: {
+                constexpr int WARPS_PER_ROW = 1;
+                dim3 block(WARPS_PER_ROW * WARP_SIZE);
+                hadamard_kernel_multi_warp_per_row<T, 256, WARPS_PER_ROW><<<grid, block, 0, stream>>>(input, output, rows);
+                break;
+            }
+            case 512: {
+                constexpr int WARPS_PER_ROW = 2;
+                dim3 block(WARPS_PER_ROW * WARP_SIZE);
+                hadamard_kernel_multi_warp_per_row<T, 512, WARPS_PER_ROW><<<grid, block, 0, stream>>>(input, output, rows);
+                break;
+            }
+            case 1024:
+            case 2048:
+            case 4096:
+            case 8192: {
+                constexpr int WARPS_PER_ROW = 4;
+                dim3 block(WARPS_PER_ROW * WARP_SIZE);
+                if (cols == 1024)
+                    hadamard_kernel_multi_warp_per_row<T, 1024, WARPS_PER_ROW><<<grid, block, 0, stream>>>(input, output, rows);
+                else if (cols == 2048)
+                    hadamard_kernel_multi_warp_per_row<T, 2048, WARPS_PER_ROW><<<grid, block, 0, stream>>>(input, output, rows);
+                else if (cols == 4096)
+                    hadamard_kernel_multi_warp_per_row<T, 4096, WARPS_PER_ROW><<<grid, block, 0, stream>>>(input, output, rows);
+                else
+                    hadamard_kernel_multi_warp_per_row<T, 8192, WARPS_PER_ROW><<<grid, block, 0, stream>>>(input, output, rows);
+                break;
+            }
+            default:
+                assert(false && "cols no");
+            }
+        } else {
+            constexpr int ROWS_PER_BLOCK = 4;
+            dim3 block(ROWS_PER_BLOCK * WARP_SIZE);
+            dim3 grid((rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+            switch (cols)
+            {
+            case 256:
+                hadamard_kernel_vec<T, 256, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+                break;
+            case 512:
+                hadamard_kernel_vec<T, 512, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+                break;
+            case 1024:
+                hadamard_kernel_vec<T, 1024, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+                break;
+            case 2048:
+                hadamard_kernel_vec<T, 2048, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+                break;
+            case 4096:
+                hadamard_kernel_vec<T, 4096, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+                break;
+            case 8192:
+                hadamard_kernel_vec<T, 8192, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(input, output, rows);
+                break;
+            default:
+                assert(false && "cols no");
+            }
         }
     } else {
         // WARPS_PER_ROW grows with cols to keep per-thread register usage <= 64
@@ -792,7 +837,7 @@ template void hadamard_v1<__half>(const __half*, __half*, int, int, cudaStream_t
 template void hadamard_v1<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);
 template void hadamard_v2<__half>(const __half*, __half*, int, int, cudaStream_t);
 template void hadamard_v2<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);
-// template void hadamard_v3<__half>(const __half*, __half*, int, int, cudaStream_t);
-// template void hadamard_v3<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);
-// template void hadamard_v4<__half>(const __half*, __half*, int, int, cudaStream_t);
-// template void hadamard_v4<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);
+template void hadamard_v3<__half>(const __half*, __half*, int, int, cudaStream_t);
+template void hadamard_v3<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);
+template void hadamard_v4<__half>(const __half*, __half*, int, int, cudaStream_t);
+template void hadamard_v4<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int, cudaStream_t);

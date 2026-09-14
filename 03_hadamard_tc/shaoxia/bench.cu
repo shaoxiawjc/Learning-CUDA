@@ -31,7 +31,7 @@ template <typename T> void hadamard_v1(const T*, T*, int, int, cudaStream_t);
 template <typename T> void hadamard_v2(const T*, T*, int, int, cudaStream_t);
 template <typename T> void hadamard_v3(const T*, T*, int, int, cudaStream_t);
 template <typename T> void hadamard_v4(const T*, T*, int, int, cudaStream_t);
-template <typename T> void hadamard_tc(const T*, T*, int, int, cudaStream_t);
+template <typename T> void hadamard_hybrid(const T*, T*, int, int, cudaStream_t);
 
 template <DType dtype> void run_fht(void*, void*, uint32_t, uint32_t, cudaStream_t);
 
@@ -62,7 +62,7 @@ template <> struct DTypeInfo<__nv_bfloat16> {
 
 // ---- CLI options ----
 struct Options {
-    std::string impl = "2";     // 1|2|3|4|tc
+    std::string impl = "2";     // 1|2|3|4|hybrid
     std::string rows = "small";
     std::string dims = "small";
     std::string dtype = "all";  // fp16|bf16|all
@@ -74,15 +74,17 @@ struct Options {
     unsigned seed = 0;
 };
 
-enum class Impl { V1, V2, V3, V4, TC };
+enum class Impl { V1, V2, V3, V4, Hybrid };
 
 Impl parse_impl(const std::string& s) {
     if (s == "1") return Impl::V1;
     if (s == "2") return Impl::V2;
     if (s == "3") return Impl::V3;
     if (s == "4") return Impl::V4;
-    if (s == "tc") return Impl::TC;
-    std::fprintf(stderr, "unknown --impl '%s' (use 1|2|3|4|tc)\n", s.c_str());
+    if (s == "hybrid") return Impl::Hybrid;
+    std::fprintf(stderr,
+                 "unknown --impl '%s' (use 1|2|3|4|hybrid)\n",
+                 s.c_str());
     std::exit(1);
 }
 
@@ -225,13 +227,20 @@ float time_launches(const std::function<void()>& fn, int iters, double warmup_ms
 
 // ---- launchers ----
 template <typename T>
-void launch_ours(Impl impl, const T* x, T* out, int rows, int cols, cudaStream_t stream) {
+void launch_ours(Impl impl, const T* x, T* out, int rows, int cols,
+                 cudaStream_t stream) {
     switch (impl) {
         case Impl::V1: hadamard_v1<T>(x, out, rows, cols, stream); break;
         case Impl::V2: hadamard_v2<T>(x, out, rows, cols, stream); break;
         case Impl::V3: hadamard_v3<T>(x, out, rows, cols, stream); break;
         case Impl::V4: hadamard_v4<T>(x, out, rows, cols, stream); break;
-        case Impl::TC: hadamard_tc<T>(x, out, rows, cols, stream); break;
+        // The tensor-core hybrid path starts at 256 elements. Keep the CLI
+        // usable with the benchmark's standard small dimension set by using
+        // the fp32 v4 path below that boundary.
+        case Impl::Hybrid:
+            if (cols < 256) hadamard_v4<T>(x, out, rows, cols, stream);
+            else hadamard_hybrid<T>(x, out, rows, cols, stream);
+            break;
     }
 }
 
@@ -280,11 +289,9 @@ float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
     return m;
 }
 
-double hada_tol(double eps, int cols) { return 8.0 * eps * std::sqrt((double)cols); }
-
 // ---- correctness pass for one shape ----
 template <typename T>
-void check_one(Impl impl, int rows, int cols, unsigned seed) {
+bool check_one(Impl impl, int rows, int cols, unsigned seed) {
     size_t numel = (size_t)rows * cols;
 
     CudaBuffer d_f32, d_x, d_out_ours, d_out_fht, d_out_hada;
@@ -322,7 +329,8 @@ void check_one(Impl impl, int rows, int cols, unsigned seed) {
     std::vector<float> ref = copy_out_to_float((const T*)d_x.ptr, numel);
     for (int r = 0; r < rows; ++r) fwht_row(ref.data() + (size_t)r * cols, cols);
 
-    launch_ours<T>(impl, (const T*)d_x.ptr, (T*)d_out_ours.ptr, rows, cols, 0);
+    launch_ours<T>(impl, (const T*)d_x.ptr, (T*)d_out_ours.ptr,
+                   rows, cols, 0);
     CUDA_CHECK(cudaDeviceSynchronize());
     if (fht_ok) {
         launch_fht<T>((const T*)fht_in, (T*)fht_out, rows, fht_dim, 0);
@@ -343,7 +351,8 @@ void check_one(Impl impl, int rows, int cols, unsigned seed) {
     if (fht_ok) theirs = copy_out_to_float((const T*)d_out_fht.ptr, numel);
     if (run_hada) hada = copy_out_to_float((const T*)d_out_hada.ptr, numel);
 
-    double tol = (impl == Impl::TC) ? hada_tol(DTypeInfo<T>::eps, cols) : DTypeInfo<T>::max_err_vs_fht;
+    double tol = DTypeInfo<T>::max_err_vs_fht;
+    bool passed = true;
 
     std::printf("  dtype=%s, rows=%d, cols=%d\n", DTypeInfo<T>::name(), rows, cols);
     std::printf("    max|ours  - ref| = %.4e\n", max_abs_diff(ours, ref));
@@ -352,13 +361,23 @@ void check_one(Impl impl, int rows, int cols, unsigned seed) {
 
     if (fht_ok) {
         double e = max_abs_diff(ours, theirs);
+        size_t ours_gt = 0, ours_lt = 0, unequal = 0, first_unequal = ours.size();
+        for (size_t i = 0; i < ours.size(); ++i) {
+            if (ours[i] > theirs[i]) { ++ours_gt; ++unequal; first_unequal = std::min(first_unequal, i); }
+            else if (ours[i] < theirs[i]) { ++ours_lt; ++unequal; first_unequal = std::min(first_unequal, i); }
+        }
         bool ok = e <= tol;
         std::printf("    max|ours  - fht| = %.4e  (requirement <= %.0e) [%s]\n",
                     e, tol, ok ? "PASS" : "FAIL");
+        std::printf("    unequal=%zu (ours>fht: %zu, ours<fht: %zu)\n",
+                    unequal, ours_gt, ours_lt);
+        if (first_unequal != ours.size())
+            std::printf("    first unequal index=%zu: ours=%+.9g, fht=%+.9g, ref=%+.9g\n",
+                        first_unequal, ours[first_unequal], theirs[first_unequal], ref[first_unequal]);
         if (!ok) {
             std::fprintf(stderr, "%s: max|ours - fht| = %.4e exceeds requirement %.0e\n",
                          DTypeInfo<T>::name(), e, tol);
-            std::exit(1);
+            passed = false;
         }
     } else {
         std::printf("    (fht n/a for cols=%d; skipping ours-vs-fht gate)\n", cols);
@@ -366,16 +385,17 @@ void check_one(Impl impl, int rows, int cols, unsigned seed) {
 
     if (run_hada) {
         double e = max_abs_diff(hada, theirs);
-        double htol = hada_tol(DTypeInfo<T>::eps, cols);
+        double htol = DTypeInfo<T>::max_err_vs_fht;
         bool ok = e <= htol;
         std::printf("    max|hada  - fht| = %.4e  (requirement <= %.0e) [%s]\n",
                     e, htol, ok ? "PASS" : "FAIL");
         if (!ok) {
             std::fprintf(stderr, "%s: max|hadacore - fht| = %.4e exceeds requirement %.0e\n",
                          DTypeInfo<T>::name(), e, htol);
-            std::exit(1);
+            passed = false;
         }
     }
+    return passed;
 }
 
 // ---- timing pass for one shape ----
@@ -448,10 +468,12 @@ void bench_one(Impl impl, int rows, int cols, int iters, double warmup_ms, unsig
 
 // ---- driver ----
 template <typename T>
-void check_dtype(Impl impl, const std::vector<int>& rows, const std::vector<int>& dims, unsigned seed) {
+int check_dtype(Impl impl, const std::vector<int>& rows, const std::vector<int>& dims, unsigned seed) {
+    int failures = 0;
     for (int cols : dims)
         for (int r : rows)
-            check_one<T>(impl, r, cols, seed);
+            if (!check_one<T>(impl, r, cols, seed)) ++failures;
+    return failures;
 }
 
 template <typename T>
@@ -496,17 +518,19 @@ int main(int argc, char** argv) {
     std::vector<int> check_dims, skipped;
     for (int d : dims) (d <= MAX_CHECK_DIM ? check_dims : skipped).push_back(d);
 
+    int check_failures = 0;
     if (!opt.no_check) {
         std::printf("== correctness (vs fp32 FWHT reference) ==\n");
         if (opt.dtype == "fp16" || opt.dtype == "all")
-            check_dtype<__half>(impl, rows, check_dims, opt.seed);
+            check_failures += check_dtype<__half>(impl, rows, check_dims, opt.seed);
         if (opt.dtype == "bf16" || opt.dtype == "all")
-            check_dtype<__nv_bfloat16>(impl, rows, check_dims, opt.seed);
+            check_failures += check_dtype<__nv_bfloat16>(impl, rows, check_dims, opt.seed);
         if (!skipped.empty()) {
             std::printf("  (skipped dims {");
             for (size_t i = 0; i < skipped.size(); ++i) std::printf("%s%d", i ? "," : "", skipped[i]);
             std::printf("}: reference capped at %d)\n", MAX_CHECK_DIM);
         }
+        std::printf("== correctness summary: %d shape(s) failed ==\n", check_failures);
     }
 
     if (!opt.no_bench) {
@@ -517,5 +541,5 @@ int main(int argc, char** argv) {
         if (opt.dtype == "bf16" || opt.dtype == "all")
             bench_dtype<__nv_bfloat16>(impl, rows, dims, opt.iters, opt.warmup_ms, opt.seed);
     }
-    return 0;
+    return check_failures == 0 ? 0 : 1;
 }
